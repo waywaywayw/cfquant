@@ -1868,7 +1868,7 @@ async function verifyPair(accountId, bridgeId) {
       body: JSON.stringify({
         account_id: accountId,
         bridge_id: bridgeId,
-        channel: selectedChannel(),
+        channel: selectedTradeChannel(),
         force: 1,
       }),
     });
@@ -2532,7 +2532,7 @@ function renderTrades(section) {
 
 async function refreshAccount(sections = 'asset,positions', options = {}) {
   const accountId = selectedAccount();
-  const channel = selectedChannel();
+  const channel = selectedTradeChannel();
   if (!accountId) {
     log('账号为空');
     return;

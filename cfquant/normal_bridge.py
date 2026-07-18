@@ -75,7 +75,7 @@ class NormalQmtBridge(TxTradeBridge):
         self._subscribe_internal_whole_quote()
         self._start_worker_thread(context)
         self._schedule_timer()
-        self._log("normal bridge worker is released by quote/timer/handlebar callbacks")
+        self._log("normal bridge worker is released by request/quote/timer/handlebar callbacks")
         self._log("normal bridge context ready")
 
     def close(self):
@@ -122,6 +122,10 @@ class NormalQmtBridge(TxTradeBridge):
             return
         try:
             self.request_queue.put_nowait((msg, time.time()))
+            # QMT timer/quote callbacks are not guaranteed to fire for every
+            # strategy period. Wake the existing worker as soon as work arrives
+            # so request handling never depends on those callbacks.
+            self._release_worker("request")
             self._log(
                 "normal bridge request queued action=%s id=%s queue_size=%s"
                 % (msg.get("action"), msg.get("id"), self.request_queue.qsize())
@@ -214,6 +218,8 @@ class NormalQmtBridge(TxTradeBridge):
                 self._drain_requests(source)
             except Exception as e:
                 self._log("normal bridge worker error source=%s error=%s" % (source, e))
+            if not self.request_queue.empty():
+                self._release_worker("backlog")
 
     def _drain_requests(self, source):
         start = time.perf_counter()

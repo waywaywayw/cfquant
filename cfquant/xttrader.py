@@ -327,6 +327,15 @@ class XtQuantTrader(object):
         result = self._trade_request("xttrader.query_stock_asset", {
             "account": _account_payload(account),
         })
+        if isinstance(result, list):
+            if not result:
+                return None
+            if len(result) != 1:
+                raise RuntimeError(
+                    "query_stock_asset expected exactly one account detail "
+                    "for account %r, got %s" % (_account_id(account), len(result))
+                )
+            result = result[0]
         return XtAsset.from_any(result)
 
     def query_stock_asset_async(self, account, callback):

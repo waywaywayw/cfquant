@@ -1995,6 +1995,14 @@ def normalize_channel(value, default="normal"):
     return value
 
 
+def normalize_account_channel(value=None):
+    # Validate the caller's value, but keep all account and trade-detail
+    # queries on the dedicated trade bridge. The normal bridge owns generic
+    # market-data and whole-quote compatibility only.
+    normalize_channel(value, "trade")
+    return "trade"
+
+
 def parse_sections(value):
     if not value:
         return ["asset", "positions", "orders", "trades"]
@@ -2365,6 +2373,7 @@ class AccountDataCache(object):
 
     def get(self, bridge_id, channel, account_id, sections, force=False):
         bridge_id = normalize_bridge_id(bridge_id)
+        channel = normalize_account_channel(channel)
         sections = [section for section in sections if section in ACCOUNT_ACTIONS]
         if not sections:
             return {"bridge_id": bridge_id, "account_id": account_id, "channel": channel}
@@ -2659,7 +2668,7 @@ def delete_account_pair(body):
 def verify_account_pair(body):
     account_id = str((body or {}).get("account_id") or "").strip()
     bridge_id = normalize_bridge_id((body or {}).get("bridge_id") or DEFAULT_BRIDGE_ID)
-    channel = normalize_channel((body or {}).get("channel"), "normal")
+    channel = normalize_account_channel((body or {}).get("channel"))
     if not account_id:
         raise ValueError("account_id is required")
     bridge_config(bridge_id)
@@ -3253,7 +3262,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     bridge_id=(query.get("bridge_id") or [""])[0],
                 )
                 bridge_config(bridge_id)
-                channel = normalize_channel((query.get("channel") or ["normal"])[0], "normal")
+                channel = normalize_account_channel((query.get("channel") or ["trade"])[0])
                 sections = parse_sections((query.get("sections") or [""])[0])
                 force = parse_bool((query.get("force") or ["0"])[0])
                 self._write_json(ok(ACCOUNT_CACHE.get(bridge_id, channel, account_id, sections, force=force)))

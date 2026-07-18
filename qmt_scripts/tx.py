@@ -17,7 +17,17 @@ import datetime
 import sys
 import subprocess
 import importlib
-import pandas as pd
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+
+def _require_pandas():
+    if pd is None:
+        raise RuntimeError("pandas is unavailable in the QMT Python environment")
+    return pd
 
 
 
@@ -78,7 +88,7 @@ class txl:
         self.sys_print(msg)
         self.server2 = False#判断服务器是不是新版本,看是否要用批量发送
         self.start()
-        self.td_df = pd.DataFrame()#存放交易日期数据，如果没有调用则不会产生数据
+        self.td_df = pd.DataFrame() if pd is not None else None#存放交易日期数据，如果没有调用则不会产生数据
         self.pre_TradeDay = {'now_date':''}#存放前一个交易日
     
     def start(self,):
@@ -897,7 +907,7 @@ class txl:
 
 
     def get_df(self,key):
-        import pandas as pd
+        pandas = _require_pandas()
         if self.__tx == False:
             code = -1
             msg = '当前tx未连接,请先执行start_tx()'
@@ -911,7 +921,7 @@ class txl:
             result = json.loads(result)
             if 'value' in result:
                 result = result['value']
-                result = pd.DataFrame(json.loads(result))
+                result = pandas.DataFrame(json.loads(result))
                 self.heartbeat = 0
             return result
 
@@ -1628,13 +1638,14 @@ class txl:
         '''        
         if str1 == str2:
             return 0
-        if self.td_df.empty:
+        pandas = _require_pandas()
+        if self.td_df is None or self.td_df.empty:
             import pandas_market_calendars as mcal        
             self.sse = mcal.get_calendar('SSE')#上海证券交易所日历        
             self.td_df = self.sse.schedule(start_date=str1, end_date=str2)        
         if str1 < str(self.td_df.index[0]) or str2 > str(self.td_df.index[-1]):
             self.td_df = self.sse.schedule(start_date=str1, end_date=str2)  
-        tem_df = pd.DataFrame()
+        tem_df = pandas.DataFrame()
         tem_df['交易日'] = self.td_df.index
         tem_df['交易日'].apply(lambda x:str(x))
         tem_td_df = tem_df[tem_df['交易日'] >= str1]
@@ -1863,7 +1874,6 @@ if __name__=='__main__':
     print('接收%s万条time.time()数据用时>>>>>>>>>%s秒'%(send_len/10000,recv_use_time))
     # while 1:
     #     time.sleep(1)
-
 
 
 

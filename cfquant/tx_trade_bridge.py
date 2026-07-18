@@ -71,6 +71,8 @@ class TxTradeBridge(object):
         self.log_file = os.path.join(os.getcwd(), "cfquant_qmt_bridge.log")
         self.account_subscribers = {}
         self.client_accounts = {}
+        self.subscriptions = {}
+        self.client_subscriptions = {}
         self.subscriber_lock = threading.RLock()
 
     def set_context(self, context):
@@ -93,6 +95,15 @@ class TxTradeBridge(object):
 
     def close(self):
         self.running = False
+        unsubscribe_quote = self._get_callable("unsubscribe_quote")
+        for subscribe_id in list(self.subscriptions):
+            try:
+                if callable(unsubscribe_quote):
+                    unsubscribe_quote(subscribe_id)
+            except Exception:
+                pass
+        self.subscriptions.clear()
+        self.client_subscriptions.clear()
         tx = self.tx
         self.tx = None
         if tx is not None:
@@ -189,6 +200,10 @@ class TxTradeBridge(object):
             return self._get_market_data_ex(params)
         if action == "xtdata.get_full_tick":
             return self.context.get_full_tick(params.get("code_list", []))
+        if action == "xtdata.subscribe_quote":
+            return self._subscribe_quote(params, msg)
+        if action == "xtdata.unsubscribe_quote":
+            return self._unsubscribe_quote(params)
         if action == "xtdata.download_history_data":
             return self._download_history_data(params)
         if action == "xtdata.download_history_data2":
@@ -217,6 +232,7 @@ class TxTradeBridge(object):
             "account_subscribers": self._account_subscriber_status(),
             "context_ready": self.context is not None,
             "tx_ready": self.tx is not None,
+            "subscriptions": len(self.subscriptions),
             "ts": time.time(),
         }
         try:
@@ -342,7 +358,12 @@ class TxTradeBridge(object):
             % (account_id, account_type.lower(), detail_type.lower())
         )
         try:
-            rows = func(account_id, account_type.lower(), detail_type.lower()) or []
+            rows = func(account_id, account_type.lower(), detail_type.lower())
+            if rows is None:
+                raise RuntimeError(
+                    "trade detail query returned None account=%s detail_type=%s"
+                    % (account_id, detail_type)
+                )
         except Exception as e:
             self._log(
                 "query_trade_detail call failed account=%s detail_type=%s error=%s"
@@ -353,7 +374,7 @@ class TxTradeBridge(object):
         result = []
         for index, row in enumerate(rows):
             try:
-                result.append(self._format_trade_detail(row, detail_type))
+                result.append(self._format_trade_detail(row, detail_type, account_id=account_id))
             except Exception as e:
                 self._log(
                     "query_trade_detail format failed detail_type=%s index=%s type=%s error=%s"
@@ -369,6 +390,62 @@ class TxTradeBridge(object):
         )
         return result
 
+    def _subscribe_quote(self, params, msg):
+        func = self._get_callable("subscribe_quote")
+        if not func:
+            raise NotImplementedError("subscribe_quote not found")
+        stock_code = params.get("stock_code", "")
+        period = params.get("period", "1d")
+        dividend_type = params.get("dividend_type") or "none"
+        client_id = msg.get("client_id") or msg.get("reply_channel") or ""
+        holder = {"id": None}
+
+        def callback(data):
+            subscribe_id = holder.get("id")
+            if subscribe_id is None:
+                return
+            self._send_event(client_id, "quote:%s" % subscribe_id, data, subscription_id=subscribe_id)
+
+        subscribe_id = self._call_variants(
+            func,
+            [
+                ((stock_code, period, params.get("start_time", ""), params.get("end_time", ""), params.get("count", 0)), {"callback": callback}),
+                ((stock_code, period, dividend_type, "", callback), {}),
+                ((stock_code, period, params.get("start_time", ""), params.get("end_time", ""), params.get("count", 0), callback), {}),
+                ((stock_code, period, callback), {}),
+            ],
+        )
+        holder["id"] = subscribe_id
+        self._remember_subscription(subscribe_id, client_id, "quote", params)
+        return {"subscribe_id": subscribe_id}
+
+    def _remember_subscription(self, subscribe_id, client_id, kind, params):
+        self.subscriptions[subscribe_id] = {
+            "client_id": client_id,
+            "kind": kind,
+            "params": dict(params or {}),
+        }
+        if client_id:
+            self.client_subscriptions.setdefault(client_id, set()).add(subscribe_id)
+
+    def _unsubscribe_quote(self, params):
+        subscribe_id = params.get("subscribe_id")
+        func = self._get_callable("unsubscribe_quote")
+        result = None
+        try:
+            if callable(func):
+                result = func(subscribe_id)
+        finally:
+            info = self.subscriptions.pop(subscribe_id, None)
+            if info:
+                client_id = info.get("client_id")
+                if client_id in self.client_subscriptions:
+                    subscriptions = self.client_subscriptions.get(client_id, set())
+                    subscriptions.discard(subscribe_id)
+                    if not subscriptions:
+                        self.client_subscriptions.pop(client_id, None)
+        return result
+
     def _order_stock(self, params, msg):
         passorder = self._get_callable("passorder")
         if not passorder:
@@ -382,23 +459,68 @@ class TxTradeBridge(object):
             order_type = 23 if order_type.lower() == "buy" else 24
         price_type = params.get("price_type", 11)
         order_remark = params.get("order_remark", msg.get("id", "tx_order"))
-        result = passorder(
-            order_type,
-            params.get("qmt_order_type", 1101),
-            account_id,
-            params.get("stock_code", params.get("code", "")),
-            price_type,
-            params.get("price", 0),
-            params.get("order_volume", params.get("num", 0)),
-            params.get("strategy_name", "1"),
-            params.get("quick_trade", 2),
-            order_remark,
-            self.context,
+        qmt_order_type = params.get("qmt_order_type", 1101)
+        stock_code = params.get("stock_code", params.get("code", ""))
+        price = params.get("price", 0)
+        order_volume = params.get("order_volume", params.get("num", 0))
+        strategy_name = params.get("strategy_name", "1")
+        quick_trade = params.get("quick_trade", 2)
+        self._log(
+            "order_stock submit account=%s stock=%s order_type=%s qmt_order_type=%s "
+            "price_type=%s price=%s volume=%s quick_trade=%s remark=%s"
+            % (
+                account_id,
+                stock_code,
+                order_type,
+                qmt_order_type,
+                price_type,
+                price,
+                order_volume,
+                quick_trade,
+                order_remark,
+            )
         )
-        return {"request_result": result, "order_id": result, "order_remark": order_remark}
+        try:
+            result = passorder(
+                order_type,
+                qmt_order_type,
+                account_id,
+                stock_code,
+                price_type,
+                price,
+                order_volume,
+                strategy_name,
+                quick_trade,
+                order_remark,
+                self.context,
+            )
+        except TypeError:
+            result = passorder(
+                order_type,
+                qmt_order_type,
+                account_id,
+                stock_code,
+                price_type,
+                price,
+                order_volume,
+                strategy_name,
+                quick_trade,
+                order_remark,
+            )
+        order_id = result if self._is_usable_order_id(result) else None
+        if order_id is None:
+            order_id = self._find_order_id(
+                account_id,
+                order_remark,
+                strategy_name,
+                params.get("find_order_wait", 2.0),
+            )
+        return {"request_result": result, "order_id": order_id, "order_remark": order_remark}
 
     def _order_stock_async(self, params, msg):
-        result = self._order_stock(params, msg)
+        async_params = dict(params)
+        async_params.setdefault("find_order_wait", 0)
+        result = self._order_stock(async_params, msg)
         data = {
             "seq": params.get("seq"),
             "account_id": (params.get("account") or {}).get("account_id", params.get("account_id", "")),
@@ -459,8 +581,43 @@ class TxTradeBridge(object):
         if not order_id:
             raise ValueError("order_id is required")
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+        order = self._find_order_for_cancel(account_id, account_type, order_id)
+        status = self._get_value(order, "order_status") if order else None
+        try:
+            status_code = int(status)
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code not in {48, 49, 50, 55}:
+            return {
+                "cancel_result": -1,
+                "request_result": False,
+                "order_id": order_id,
+                "reason": "order_not_active_or_status_unknown",
+                "order_status": status,
+            }
         result = cancel_func(order_id, account_id, account_type, self.context)
         return {"cancel_result": 0 if result else -1, "request_result": result, "order_id": order_id}
+
+    def _find_order_for_cancel(self, account_id, account_type, order_id):
+        orders = self._query_trade_detail(
+            {
+                "account_id": account_id,
+                "account_type": account_type,
+            },
+            "order",
+        )
+        expected = str(order_id)
+        aliases = (
+            "order_sysid",
+            "order_id",
+            "m_strOrderSysID",
+            "m_nOrderID",
+            "m_strOrderID",
+        )
+        for order in orders or []:
+            if any(str(self._get_value(order, name)) == expected for name in aliases):
+                return order
+        return None
 
     def _cancel_order_stock_async(self, params, msg):
         result = self._cancel_order_stock(params)
@@ -761,13 +918,55 @@ class TxTradeBridge(object):
         self._log("account unsubscribed account=%s client_id=%s" % (account_id or "-", client_id or "-"))
         return 0
 
-    def _format_trade_detail(self, obj, detail_type):
+    def _format_trade_detail(self, obj, detail_type, account_id=""):
         detail_type = str(detail_type).lower()
+        resolved_account_id = self._first_value(obj, ("account_id", "m_strAccountID")) or account_id
         if detail_type == "order":
             return {
+                "account_id": resolved_account_id,
                 "stock_code": self._stock_code(obj),
                 "market": self._get_value(obj, "m_strExchangeID"),
                 "instrument_name": self._get_value(obj, "m_strInstrumentName"),
+                "order_remark": self._first_value(obj, (
+                    "order_remark",
+                    "remark",
+                    "m_strRemark",
+                )),
+                "order_id": self._first_value(obj, (
+                    "order_id",
+                    "m_nOrderID",
+                    "m_strOrderID",
+                )),
+                "order_sysid": self._first_value(obj, (
+                    "order_sysid",
+                    "sysid",
+                    "m_strOrderSysID",
+                )),
+                "order_type": self._first_value(obj, (
+                    "order_type",
+                    "direction",
+                    "m_nOrderType",
+                    "m_nDirection",
+                    "m_nOffsetFlag",
+                )),
+                "direction": self._first_value(obj, (
+                    "direction",
+                    "order_type",
+                    "m_nOffsetFlag",
+                    "m_nDirection",
+                    "m_nOrderType",
+                )),
+                "price_type": self._first_value(obj, (
+                    "price_type",
+                    "price_type_name",
+                    "m_nPriceType",
+                )),
+                "price": self._first_value(obj, (
+                    "price",
+                    "order_price",
+                    "m_dPrice",
+                    "m_dOrderPrice",
+                )),
                 "order_time": self._first_value(obj, (
                     "order_time",
                     "entrust_time",
@@ -793,10 +992,22 @@ class TxTradeBridge(object):
                 "traded_price": self._get_value(obj, "m_dTradedPrice"),
                 "traded_volume": self._get_value(obj, "m_nVolumeTraded"),
                 "trade_amount": self._get_value(obj, "m_dTradeAmount"),
-                "order_status": self._get_value(obj, "m_nOrderStatus"),
+                "order_status": self._first_value(obj, (
+                    "order_status",
+                    "status",
+                    "m_nOrderStatus",
+                    "m_strOrderStatus",
+                    "m_nOrderState",
+                    "m_strStatus",
+                )),
                 "m_strInstrumentID": self._get_value(obj, "m_strInstrumentID"),
                 "m_strExchangeID": self._get_value(obj, "m_strExchangeID"),
                 "m_strInstrumentName": self._get_value(obj, "m_strInstrumentName"),
+                "m_nOrderType": self._get_value(obj, "m_nOrderType"),
+                "m_nDirection": self._get_value(obj, "m_nDirection"),
+                "m_nPriceType": self._get_value(obj, "m_nPriceType"),
+                "m_dPrice": self._get_value(obj, "m_dPrice"),
+                "m_dOrderPrice": self._get_value(obj, "m_dOrderPrice"),
                 "m_nOffsetFlag": self._get_value(obj, "m_nOffsetFlag"),
                 "m_nVolumeTotalOriginal": self._get_value(obj, "m_nVolumeTotalOriginal"),
                 "m_dTradedPrice": self._get_value(obj, "m_dTradedPrice"),
@@ -813,6 +1024,7 @@ class TxTradeBridge(object):
                 "m_strOrderTime": self._get_value(obj, "m_strOrderTime"),
                 "m_strEntrustTime": self._get_value(obj, "m_strEntrustTime"),
                 "m_strInsertTime": self._get_value(obj, "m_strInsertTime"),
+                "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_nOrderTime": self._get_value(obj, "m_nOrderTime"),
                 "m_nEntrustTime": self._get_value(obj, "m_nEntrustTime"),
                 "m_nInsertTime": self._get_value(obj, "m_nInsertTime"),
@@ -822,9 +1034,55 @@ class TxTradeBridge(object):
             }
         if detail_type == "deal":
             return {
+                "account_id": resolved_account_id,
                 "stock_code": self._stock_code(obj),
                 "market": self._get_value(obj, "m_strExchangeID"),
                 "instrument_name": self._get_value(obj, "m_strInstrumentName"),
+                "order_remark": self._first_value(obj, (
+                    "order_remark",
+                    "remark",
+                    "m_strRemark",
+                )),
+                "order_id": self._first_value(obj, (
+                    "order_id",
+                    "m_nOrderID",
+                    "m_strOrderID",
+                )),
+                "order_sysid": self._first_value(obj, (
+                    "order_sysid",
+                    "sysid",
+                    "m_strOrderSysID",
+                )),
+                "trade_id": self._first_value(obj, (
+                    "trade_id",
+                    "traded_id",
+                    "m_strTradeID",
+                    "m_nTradeID",
+                )),
+                "deal_id": self._first_value(obj, (
+                    "deal_id",
+                    "m_strDealID",
+                    "m_nDealID",
+                )),
+                "order_type": self._first_value(obj, (
+                    "order_type",
+                    "direction",
+                    "m_nOrderType",
+                    "m_nDirection",
+                    "m_nOffsetFlag",
+                )),
+                "direction": self._first_value(obj, (
+                    "direction",
+                    "order_type",
+                    "m_nOffsetFlag",
+                    "m_nDirection",
+                    "m_nOrderType",
+                )),
+                "price_type": self._first_value(obj, (
+                    "price_type",
+                    "price_type_name",
+                    "m_nPriceType",
+                )),
                 "trade_time": self._first_value(obj, (
                     "trade_time",
                     "deal_time",
@@ -843,18 +1101,41 @@ class TxTradeBridge(object):
                     "m_nDealDate",
                 )),
                 "offset_flag": self._get_value(obj, "m_nOffsetFlag"),
-                "price": self._get_value(obj, "m_dPrice"),
+                "price": self._first_value(obj, (
+                    "price",
+                    "m_dPrice",
+                )),
                 "volume": self._get_value(obj, "m_nVolume"),
                 "trade_amount": self._get_value(obj, "m_dTradeAmount"),
+                "order_status": self._first_value(obj, (
+                    "order_status",
+                    "status",
+                    "m_nOrderStatus",
+                    "m_strOrderStatus",
+                    "m_nOrderState",
+                    "m_strStatus",
+                )),
                 "m_strInstrumentID": self._get_value(obj, "m_strInstrumentID"),
                 "m_strExchangeID": self._get_value(obj, "m_strExchangeID"),
                 "m_strInstrumentName": self._get_value(obj, "m_strInstrumentName"),
+                "m_strRemark": self._get_value(obj, "m_strRemark"),
+                "m_nOrderID": self._get_value(obj, "m_nOrderID"),
+                "m_strOrderID": self._get_value(obj, "m_strOrderID"),
+                "m_strOrderSysID": self._get_value(obj, "m_strOrderSysID"),
+                "m_nOrderType": self._get_value(obj, "m_nOrderType"),
+                "m_nDirection": self._get_value(obj, "m_nDirection"),
+                "m_nPriceType": self._get_value(obj, "m_nPriceType"),
+                "m_strTradeID": self._get_value(obj, "m_strTradeID"),
+                "m_nTradeID": self._get_value(obj, "m_nTradeID"),
+                "m_strDealID": self._get_value(obj, "m_strDealID"),
+                "m_nDealID": self._get_value(obj, "m_nDealID"),
                 "m_nOffsetFlag": self._get_value(obj, "m_nOffsetFlag"),
                 "m_dPrice": self._get_value(obj, "m_dPrice"),
                 "m_nVolume": self._get_value(obj, "m_nVolume"),
                 "m_dTradeAmount": self._get_value(obj, "m_dTradeAmount"),
                 "m_strTradeTime": self._get_value(obj, "m_strTradeTime"),
                 "m_strDealTime": self._get_value(obj, "m_strDealTime"),
+                "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_nTradeTime": self._get_value(obj, "m_nTradeTime"),
                 "m_nDealTime": self._get_value(obj, "m_nDealTime"),
                 "m_strTradeDate": self._get_value(obj, "m_strTradeDate"),
@@ -863,6 +1144,7 @@ class TxTradeBridge(object):
             }
         if detail_type == "position":
             return {
+                "account_id": resolved_account_id,
                 "stock_code": self._stock_code(obj),
                 "market": self._get_value(obj, "m_strExchangeID"),
                 "instrument_name": self._get_value(obj, "m_strInstrumentName"),
@@ -879,11 +1161,13 @@ class TxTradeBridge(object):
                 "m_nCanUseVolume": self._get_value(obj, "m_nCanUseVolume"),
                 "m_dOpenPrice": self._get_value(obj, "m_dOpenPrice"),
                 "m_dInstrumentValue": self._get_value(obj, "m_dInstrumentValue"),
+                "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_dPositionCost": self._get_value(obj, "m_dPositionCost"),
                 "m_dPositionProfit": self._get_value(obj, "m_dPositionProfit"),
             }
         if detail_type == "account":
             return {
+                "account_id": resolved_account_id,
                 "balance": self._get_value(obj, "m_dBalance"),
                 "assure_asset": self._get_value(obj, "m_dAssureAsset"),
                 "market_value": self._get_value(obj, "m_dInstrumentValue"),
@@ -895,9 +1179,49 @@ class TxTradeBridge(object):
                 "m_dInstrumentValue": self._get_value(obj, "m_dInstrumentValue"),
                 "m_dTotalDebit": self._get_value(obj, "m_dTotalDebit"),
                 "m_dAvailable": self._get_value(obj, "m_dAvailable"),
+                "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_dPositionProfit": self._get_value(obj, "m_dPositionProfit"),
             }
         return {"value": str(obj)}
+
+    def _find_order_id(self, account_id, user_order_id, strategy_name="", wait_seconds=0.3):
+        wait_seconds = float(wait_seconds or 0)
+        deadline = time.time() + wait_seconds
+        while True:
+            try:
+                orders = self._query_trade_detail(
+                    {
+                        "account_id": account_id,
+                        "account_type": 2,
+                        "strategy_name": strategy_name,
+                    },
+                    "order",
+                )
+                for order in orders or []:
+                    remark = self._get_value(order, "order_remark")
+                    if remark != user_order_id:
+                        continue
+                    for attr in ("order_sysid", "order_id", "m_strOrderSysID", "m_nOrderID", "m_strOrderID"):
+                        value = self._get_value(order, attr)
+                        if value is not None and value != "":
+                            return value
+            except Exception:
+                pass
+            if wait_seconds <= 0 or time.time() > deadline:
+                break
+            time.sleep(0.05)
+        return None
+
+    def _is_usable_order_id(self, value):
+        if value is None or isinstance(value, bool):
+            return False
+        text = str(value).strip()
+        if not text:
+            return False
+        try:
+            return int(text) > 0
+        except (TypeError, ValueError):
+            return True
 
     def _first_value(self, obj, names):
         for name in names:
