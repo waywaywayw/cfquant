@@ -39,9 +39,7 @@ class NormalQmtBridge(TxTradeBridge):
         self.request_queue = queue.Queue(maxsize=10000)
         self.recv_thread = None
         self.worker_thread = None
-        self.worker_event = threading.Event()
-        self.worker_source = ""
-        self.worker_source_lock = threading.Lock()
+        self.drain_lock = threading.Lock()
         self.pump_max_count = int(pump_max_count)
         self.pump_max_ms = float(pump_max_ms)
         self.subscription_seq = 0
@@ -73,14 +71,12 @@ class NormalQmtBridge(TxTradeBridge):
     def set_context(self, context):
         self.context = context
         self._subscribe_internal_whole_quote()
-        self._start_worker_thread(context)
         self._schedule_timer()
-        self._log("normal bridge worker is released by request/quote/timer/handlebar callbacks")
+        self._log("normal bridge requests run on QMT timer/quote/handlebar callbacks")
         self._log("normal bridge context ready")
 
     def close(self):
         self.running = False
-        self.worker_event.set()
         if self.context is not None and self.schedule_key:
             try:
                 self.context.cancel_schedule_run(self.schedule_key)
@@ -114,46 +110,19 @@ class NormalQmtBridge(TxTradeBridge):
         if action == "xtdata.subscribe_whole_quote":
             self._handle_whole_quote_publish_subscribe(msg)
             return
-        if action == "xtdata.subscribe_quote":
-            self._handle_quote_subscribe(msg, kind="quote")
-            return
         if action == "xtdata.unsubscribe_quote":
-            self._handle_quote_unsubscribe(msg)
-            return
+            params = msg.get("params") or {}
+            if str(params.get("subscribe_id")) == str(self.whole_quote_publish_sub_id):
+                self._handle_quote_unsubscribe(msg)
+                return
         try:
             self.request_queue.put_nowait((msg, time.time()))
-            # QMT timer/quote callbacks are not guaranteed to fire for every
-            # strategy period. Wake the existing worker as soon as work arrives
-            # so request handling never depends on those callbacks.
-            self._release_worker("request")
             self._log(
                 "normal bridge request queued action=%s id=%s queue_size=%s"
                 % (msg.get("action"), msg.get("id"), self.request_queue.qsize())
             )
         except queue.Full as e:
             self._send_error(msg, e)
-
-    def _start_worker_thread(self, context):
-        if self.worker_thread is not None and self.worker_thread.is_alive():
-            return
-        self.context = context
-        self.worker_thread = threading.Thread(target=self._worker_loop, args=(context,))
-        self.worker_thread.daemon = True
-        self.worker_thread.start()
-        self._log("normal bridge worker thread started in init context")
-
-    def _handle_quote_subscribe(self, msg, kind):
-        self.subscription_seq += 1
-        sub_id = self.subscription_seq
-        params = msg.get("params") or {}
-        self.quote_subscriptions[sub_id] = {
-            "kind": kind,
-            "client_id": msg.get("client_id"),
-            "stock_code": params.get("stock_code", ""),
-            "code_list": params.get("code_list", params.get("stock_list", [])),
-        }
-        self._send_response(msg, {"subscribe_id": sub_id})
-        self._log("normal bridge quote subscribed id=%s kind=%s" % (sub_id, kind))
 
     def _handle_whole_quote_publish_subscribe(self, msg):
         if self.whole_quote_publish_sub_id is None:
@@ -194,61 +163,42 @@ class NormalQmtBridge(TxTradeBridge):
         self._log("normal bridge quote unsubscribed id=%s" % sub_id)
 
     def pump(self):
-        self._release_worker("pump")
+        self._drain_requests("handlebar")
         return self.request_queue.qsize()
 
-    def _release_worker(self, source):
-        with self.worker_source_lock:
-            self.worker_source = source
-        self.worker_event.set()
-
-    def _worker_loop(self, context=None):
-        if context is not None:
-            self.context = context
-        while self.running:
-            self.worker_event.wait(0.5)
-            if not self.running:
-                break
-            if not self.worker_event.is_set():
-                continue
-            self.worker_event.clear()
-            with self.worker_source_lock:
-                source = self.worker_source or "unknown"
-            try:
-                self._drain_requests(source)
-            except Exception as e:
-                self._log("normal bridge worker error source=%s error=%s" % (source, e))
-            if not self.request_queue.empty():
-                self._release_worker("backlog")
-
     def _drain_requests(self, source):
-        start = time.perf_counter()
-        count = 0
-        while self.running and count < self.pump_max_count:
-            if (time.perf_counter() - start) * 1000 >= self.pump_max_ms:
-                break
-            try:
-                msg, received_at = self.request_queue.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
-                self._send_response(msg, result)
-                self._log(
-                    "normal bridge worker response source=%s action=%s id=%s total_ms=%.2f"
-                    % (source, msg.get("action"), msg.get("id"), (time.time() - received_at) * 1000)
-                )
-            except Exception as e:
-                self._log(
-                    "normal bridge worker request_error source=%s action=%s id=%s error=%s"
-                    % (source, msg.get("action"), msg.get("id"), e)
-                )
-                self._send_error(msg, e)
-            count += 1
-        return count
+        if not self.drain_lock.acquire(False):
+            return 0
+        try:
+            start = time.perf_counter()
+            count = 0
+            while self.running and count < self.pump_max_count:
+                if (time.perf_counter() - start) * 1000 >= self.pump_max_ms:
+                    break
+                try:
+                    msg, received_at = self.request_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
+                    self._send_response(msg, result)
+                    self._log(
+                        "normal bridge QMT response source=%s action=%s id=%s total_ms=%.2f"
+                        % (source, msg.get("action"), msg.get("id"), (time.time() - received_at) * 1000)
+                    )
+                except Exception as e:
+                    self._log(
+                        "normal bridge QMT request_error source=%s action=%s id=%s error=%s"
+                        % (source, msg.get("action"), msg.get("id"), e)
+                    )
+                    self._send_error(msg, e)
+                count += 1
+            return count
+        finally:
+            self.drain_lock.release()
 
     def _on_whole_quote(self, data):
-        self._release_worker("whole_quote")
+        self._drain_requests("whole_quote")
         if not self.quote_subscriptions:
             return
         for sub_id, sub in list(self.quote_subscriptions.items()):
@@ -274,7 +224,7 @@ class NormalQmtBridge(TxTradeBridge):
             self.tx.push("event", event, client_id)
 
     def _on_timer(self, *args, **kwargs):
-        self._release_worker("timer")
+        self._drain_requests("timer")
 
     def _subscribe_internal_whole_quote(self):
         if self.context is None or self.whole_quote_sub_id:
@@ -403,7 +353,8 @@ class NormalQmtBridge(TxTradeBridge):
             "worker_thread_alive": self.worker_thread.is_alive() if self.worker_thread else False,
             "whole_quote_sub_id": self.whole_quote_sub_id,
             "schedule_key": self.schedule_key,
-            "quote_subscription_count": len(self.quote_subscriptions),
+            "quote_subscription_count": len(self.quote_subscriptions) + len(self.subscriptions),
+            "native_quote_subscription_count": len(self.subscriptions),
             "whole_quote_publish_enabled": self.whole_quote_publish_enabled,
             "whole_quote_publish_sub_id": self.whole_quote_publish_sub_id,
             "pump_max_count": self.pump_max_count,
