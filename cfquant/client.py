@@ -46,9 +46,37 @@ class LTtxRpcClient(object):
             if self._started:
                 return
             txl = self._load_txl()
-            self._tx = txl(self.host, self.port, self.token)
-            self._tx.start_tx()
-            self._tx.start_txg(self.client_id)
+            tx = txl(self.host, self.port, self.token)
+            completed = threading.Event()
+            errors = []
+
+            def connect():
+                try:
+                    tx.start_tx()
+                    tx.start_txg(self.client_id)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    completed.set()
+
+            connect_thread = threading.Thread(target=connect)
+            connect_thread.daemon = True
+            connect_thread.start()
+            if not completed.wait(timeout=max(0.1, self.timeout)):
+                try:
+                    tx.close()
+                except Exception:
+                    pass
+                raise CfquantTimeout(
+                    "cfquant connect timeout after %.1fs" % self.timeout
+                )
+            if errors:
+                try:
+                    tx.close()
+                except Exception:
+                    pass
+                raise CfquantError("cfquant connect failed: %s" % errors[0])
+            self._tx = tx
             self._started = True
             self._recv_thread = threading.Thread(target=self._recv_loop)
             self._recv_thread.daemon = True
@@ -95,6 +123,10 @@ class LTtxRpcClient(object):
         except queue.Empty:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
+            # LTtx owns non-daemon transport threads. Leaving the transport
+            # open after a timed-out one-shot request keeps the Python process
+            # alive indefinitely even though the caller has already failed.
+            self.close()
             raise CfquantTimeout("cfquant request timeout: %s" % action)
         if not msg.get("ok"):
             err = msg.get("error") or {}

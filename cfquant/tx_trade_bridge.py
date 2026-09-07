@@ -43,6 +43,32 @@ XTTRADER_COMPAT_CANDIDATES = {
     "smt_compact_renewal": ("smt_compact_renewal",),
 }
 
+# QMT's embedded account object contains a wider asset breakdown than the
+# six fields historically forwarded by cfquant. Keep the raw names alongside
+# stable aliases so broker-specific assets such as reverse repos are not lost.
+ACCOUNT_DETAIL_FIELDS = (
+    ("frozen_cash", "m_dFrozenCash"),
+    ("frozen_commission", "m_dFrozenCommission"),
+    ("commission", "m_dCommission"),
+    ("pre_balance", "m_dPreBalance"),
+    ("asset_balance", "m_dAssetBalance"),
+    ("withdrawable", "m_dFetchBalance"),
+    ("stock_value", "m_dStockValue"),
+    ("bond_value", "m_dLoanValue"),
+    ("fund_value", "m_dFundValue"),
+    ("repurchase_value", "m_dRepurchaseValue"),
+    ("buy_wait_money", "m_dBuyWaitMoney"),
+    ("sell_wait_money", "m_dSellWaitMoney"),
+    ("entrust_asset", "m_dEntrustAsset"),
+    ("cash_in", "m_dCashIn"),
+    ("deposit", "m_dDeposit"),
+    ("withdraw", "m_dWithdraw"),
+    ("trading_date", "m_strTradingDate"),
+    ("account_status", "m_strStatus"),
+)
+ACCOUNT_DETAIL_RAW_FIELDS = tuple(raw_name for _, raw_name in ACCOUNT_DETAIL_FIELDS)
+_BRIDGE_LOG_LOCK = threading.RLock()
+
 
 class TxTradeBridge(object):
     def __init__(
@@ -69,6 +95,8 @@ class TxTradeBridge(object):
         self.running = False
         self.tx = None
         self.log_file = os.path.join(os.getcwd(), "cfquant_qmt_bridge.log")
+        self.log_max_bytes = int(os.environ.get("CFQUANT_BRIDGE_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+        self.log_backup_count = int(os.environ.get("CFQUANT_BRIDGE_LOG_BACKUP_COUNT", "2"))
         self.account_subscribers = {}
         self.client_accounts = {}
         self.subscriptions = {}
@@ -143,16 +171,18 @@ class TxTradeBridge(object):
         try:
             result = self._dispatch(action, msg.get("params") or {}, msg)
             response = pack_response(request_id, ok=True, result=result)
-            self._log("tx trade response_ready action=%s id=%s" % (action, request_id))
+            if action not in ("cfquant.status", "cfquant.ping"):
+                self._log("tx trade response_ready action=%s id=%s" % (action, request_id))
         except Exception as e:
             response = pack_response(request_id, ok=False, error=e)
             self._log("tx trade request_error action=%s id=%s error=%s" % (action, request_id, e))
         if client_id:
             self.tx.push("response", response, client_id)
-            self._log(
-                "tx trade response_sent action=%s id=%s client_id=%s total_ms=%.2f"
-                % (action, request_id, client_id, (time.time() - received_at) * 1000)
-            )
+            if action not in ("cfquant.status", "cfquant.ping"):
+                self._log(
+                    "tx trade response_sent action=%s id=%s client_id=%s total_ms=%.2f"
+                    % (action, request_id, client_id, (time.time() - received_at) * 1000)
+                )
 
     def _dispatch(self, action, params, msg):
         if action == "cfquant.ping":
@@ -960,12 +990,14 @@ class TxTradeBridge(object):
                     "price_type",
                     "price_type_name",
                     "m_nPriceType",
+                    "m_nOrderPriceType",
                 )),
                 "price": self._first_value(obj, (
                     "price",
                     "order_price",
                     "m_dPrice",
                     "m_dOrderPrice",
+                    "m_dLimitPrice",
                 )),
                 "order_time": self._first_value(obj, (
                     "order_time",
@@ -986,6 +1018,7 @@ class TxTradeBridge(object):
                     "m_strTradingDay",
                     "m_nOrderDate",
                     "m_nEntrustDate",
+                    "m_strInsertDate",
                 )),
                 "offset_flag": self._get_value(obj, "m_nOffsetFlag"),
                 "order_volume": self._get_value(obj, "m_nVolumeTotalOriginal"),
@@ -1006,8 +1039,10 @@ class TxTradeBridge(object):
                 "m_nOrderType": self._get_value(obj, "m_nOrderType"),
                 "m_nDirection": self._get_value(obj, "m_nDirection"),
                 "m_nPriceType": self._get_value(obj, "m_nPriceType"),
+                "m_nOrderPriceType": self._get_value(obj, "m_nOrderPriceType"),
                 "m_dPrice": self._get_value(obj, "m_dPrice"),
                 "m_dOrderPrice": self._get_value(obj, "m_dOrderPrice"),
+                "m_dLimitPrice": self._get_value(obj, "m_dLimitPrice"),
                 "m_nOffsetFlag": self._get_value(obj, "m_nOffsetFlag"),
                 "m_nVolumeTotalOriginal": self._get_value(obj, "m_nVolumeTotalOriginal"),
                 "m_dTradedPrice": self._get_value(obj, "m_dTradedPrice"),
@@ -1031,6 +1066,7 @@ class TxTradeBridge(object):
                 "m_strOrderDate": self._get_value(obj, "m_strOrderDate"),
                 "m_strEntrustDate": self._get_value(obj, "m_strEntrustDate"),
                 "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
+                "m_strInsertDate": self._get_value(obj, "m_strInsertDate"),
             }
         if detail_type == "deal":
             return {
@@ -1166,22 +1202,33 @@ class TxTradeBridge(object):
                 "m_dPositionProfit": self._get_value(obj, "m_dPositionProfit"),
             }
         if detail_type == "account":
-            return {
+            balance = self._get_value(obj, "m_dBalance")
+            available = self._get_value(obj, "m_dAvailable")
+            market_value = self._get_value(obj, "m_dInstrumentValue")
+            payload = {
                 "account_id": resolved_account_id,
-                "balance": self._get_value(obj, "m_dBalance"),
+                "balance": balance,
+                "total_asset": balance,
                 "assure_asset": self._get_value(obj, "m_dAssureAsset"),
-                "market_value": self._get_value(obj, "m_dInstrumentValue"),
+                "market_value": market_value,
                 "total_debit": self._get_value(obj, "m_dTotalDebit"),
-                "available": self._get_value(obj, "m_dAvailable"),
+                "available": available,
+                "cash": available,
                 "position_profit": self._get_value(obj, "m_dPositionProfit"),
-                "m_dBalance": self._get_value(obj, "m_dBalance"),
+                "m_dBalance": balance,
                 "m_dAssureAsset": self._get_value(obj, "m_dAssureAsset"),
-                "m_dInstrumentValue": self._get_value(obj, "m_dInstrumentValue"),
+                "m_dInstrumentValue": market_value,
                 "m_dTotalDebit": self._get_value(obj, "m_dTotalDebit"),
-                "m_dAvailable": self._get_value(obj, "m_dAvailable"),
+                "m_dAvailable": available,
                 "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_dPositionProfit": self._get_value(obj, "m_dPositionProfit"),
             }
+            for alias, raw_name in ACCOUNT_DETAIL_FIELDS:
+                value = self._get_value(obj, raw_name)
+                payload[alias] = value
+                payload[raw_name] = value
+            payload["frozen"] = payload["frozen_cash"]
+            return payload
         return {"value": str(obj)}
 
     def _find_order_id(self, account_id, user_order_id, strategy_name="", wait_seconds=0.3):
@@ -1360,12 +1407,32 @@ class TxTradeBridge(object):
     def _log(self, msg):
         line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
         try:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            with _BRIDGE_LOG_LOCK:
+                self._rotate_log_if_needed()
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
         except Exception:
             pass
         if self.show:
             print(msg)
+
+    def _rotate_log_if_needed(self):
+        if self.log_max_bytes <= 0 or not os.path.isfile(self.log_file):
+            return
+        if os.path.getsize(self.log_file) < self.log_max_bytes:
+            return
+        backup_count = max(0, self.log_backup_count)
+        if backup_count == 0:
+            os.remove(self.log_file)
+            return
+        oldest = "%s.%s" % (self.log_file, backup_count)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for index in range(backup_count - 1, 0, -1):
+            source = "%s.%s" % (self.log_file, index)
+            if os.path.exists(source):
+                os.replace(source, "%s.%s" % (self.log_file, index + 1))
+        os.replace(self.log_file, "%s.1" % self.log_file)
 
 
 def start_tx_trade_bridge(

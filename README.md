@@ -133,6 +133,17 @@ CFQUANT_LTTX_TOKEN=LTtx
 CFQUANT_TIMEOUT=15
 ```
 
+普通 QMT 桥默认会内部订阅沪深全市场行情，以兼容外部全推订阅。只需要按标的订阅时，在启动 QMT 前设置：
+
+```text
+CFQUANT_INTERNAL_WHOLE_QUOTE=0
+```
+
+此模式下 `subscribe_quote` 会直接调用 QMT 的单标的订阅，`subscribe_whole_quote` 会明确报错而不会隐式恢复全市场订阅。
+
+桥日志 `cfquant_qmt_bridge.log` 默认按 10 MB 轮转并保留 2 份备份，可通过
+`CFQUANT_BRIDGE_LOG_MAX_BYTES` 和 `CFQUANT_BRIDGE_LOG_BACKUP_COUNT` 调整。
+
 ### 行情查询示例
 
 ```python
@@ -166,6 +177,11 @@ positions = trader.query_stock_positions(account)
 print(asset)
 print(positions)
 ```
+
+资产查询除 `balance`、`available`、`market_value` 外，还保留 QMT 的冻结资金、
+可取资金、股票/基金/债券市值、回购市值、待交收资金等原始字段。券商实现可能
+不会填充所有分类字段，因此不能把“总资产减现金减证券市值”的残差直接视为
+冻结资金或逆回购。
 
 交易侧按资金账号路由：外部 Python 会读取当前项目目录或 `CFQUANT_WEB_CONFIG_FILE` 指向的 `cfquant_web_config.json`，如果里面已有 Web 控制台保存的“资金账号 -> 桥接端”绑定，只需要传同一个资金账号；如果不使用这份 Web 配置，也可以显式指定桥接端：
 

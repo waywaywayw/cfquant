@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cfquant.protocol import loads_message
+from cfquant.protocol import dumps_message
 from cfquant.normal_bridge import NormalQmtBridge
 from cfquant.tx_trade_bridge import TxTradeBridge
 
@@ -85,6 +86,28 @@ def test_normal_and_lowlat_bridges_share_order_and_cancel_implementation() -> No
     assert NormalQmtBridge._cancel_order_stock is TxTradeBridge._cancel_order_stock
 
 
+def test_status_probe_does_not_write_per_request_bridge_logs() -> None:
+    bridge = _bridge()
+    bridge.tx = FakeTx()
+    logs = []
+    bridge._log = logs.append
+
+    bridge._handle_raw(
+        dumps_message(
+            {
+                "type": "request",
+                "id": "status-1",
+                "action": "cfquant.status",
+                "params": {},
+                "client_id": "client-1",
+            }
+        )
+    )
+
+    assert logs == []
+    assert len(bridge.tx.pushed) == 1
+
+
 def test_format_trade_detail_order_exposes_standard_alias_fields() -> None:
     bridge = _bridge()
     raw = SimpleNamespace(
@@ -117,6 +140,63 @@ def test_format_trade_detail_order_exposes_standard_alias_fields() -> None:
     assert payload["order_date"] == "20260715"
     assert payload["order_time"] == "09:35:01"
     assert payload["m_strOrderSysID"] == "SYS-1"
+
+
+def test_query_trade_detail_order_maps_qmt_native_aliases() -> None:
+    raw = SimpleNamespace(
+        m_strInstrumentID="301559",
+        m_strExchangeID="SZ",
+        m_strRemark="WQd4c2cce977aa284c017d41",
+        m_nOrderID=34944,
+        m_strOrderSysID="34944",
+        m_nOrderType=23,
+        m_nOrderPriceType=50,
+        m_dLimitPrice=10.25,
+        m_dTradedPrice=0,
+        m_nOrderStatus=54,
+        m_nVolumeTotalOriginal=200,
+        m_nVolumeTraded=0,
+        m_strOrderTime="09:35:01",
+        m_strInsertDate="20260907",
+    )
+    bridge = TxTradeBridge(
+        context=None,
+        globals_dict={"get_trade_detail_data": lambda account_id, account_type, kind: [raw]},
+    )
+
+    payload = bridge._query_trade_detail({"account_id": "2070001669"}, "order")[0]
+
+    assert payload["price_type"] == 50
+    assert payload["price"] == 10.25
+    assert payload["traded_price"] == 0
+    assert payload["order_date"] == "20260907"
+    assert payload["m_nOrderPriceType"] == 50
+    assert payload["m_dLimitPrice"] == 10.25
+    assert payload["m_strInsertDate"] == "20260907"
+
+
+def test_query_trade_detail_order_preserves_old_alias_priority_and_zero() -> None:
+    raw = SimpleNamespace(
+        m_strInstrumentID="600000",
+        m_strExchangeID="SH",
+        price_type=5,
+        m_nPriceType=5,
+        m_nOrderPriceType=50,
+        price=0,
+        m_dLimitPrice=10.25,
+        order_date="20260801",
+        m_strInsertDate="20260907",
+    )
+    bridge = TxTradeBridge(
+        context=None,
+        globals_dict={"get_trade_detail_data": lambda account_id, account_type, kind: [raw]},
+    )
+
+    payload = bridge._query_trade_detail({"account_id": "2070001669"}, "order")[0]
+
+    assert payload["price_type"] == 5
+    assert payload["price"] == 0
+    assert payload["order_date"] == "20260801"
 
 
 def test_format_trade_detail_deal_exposes_standard_alias_fields() -> None:
@@ -234,6 +314,38 @@ def test_query_trade_detail_propagates_request_account_id_to_all_payload_types()
     assert deal_rows[0]["account_id"] == "2070001669"
     assert position_rows[0]["account_id"] == "2070001669"
     assert account_rows[0]["account_id"] == "2070001669"
+
+
+def test_format_trade_detail_account_preserves_asset_classification() -> None:
+    bridge = _bridge()
+    raw = SimpleNamespace(
+        m_strAccountID="28100046850",
+        m_dBalance=470096.99,
+        m_dAvailable=6.5,
+        m_dFrozenCash=170000.0,
+        m_dInstrumentValue=0.0,
+        m_dStockValue=0.0,
+        m_dFundValue=0.0,
+        m_dLoanValue=0.0,
+        m_dRepurchaseValue=300000.0,
+        m_dFetchBalance=6.5,
+        m_dBuyWaitMoney=0.0,
+        m_dSellWaitMoney=0.0,
+        m_dCommission=0.0,
+        m_strTradingDate="20260731",
+    )
+
+    payload = bridge._format_trade_detail(raw, "account")
+
+    assert payload["account_id"] == "28100046850"
+    assert payload["total_asset"] == 470096.99
+    assert payload["cash"] == 6.5
+    assert payload["frozen"] == 170000.0
+    assert payload["frozen_cash"] == 170000.0
+    assert payload["repurchase_value"] == 300000.0
+    assert payload["m_dRepurchaseValue"] == 300000.0
+    assert payload["withdrawable"] == 6.5
+    assert payload["trading_date"] == "20260731"
 
 
 @pytest.mark.parametrize("detail_type", ["position", "order", "deal"])

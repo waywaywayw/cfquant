@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 import datetime as dt
 import json
+import os
 import queue
 import threading
 import time
 
 from .protocol import loads_message, pack_event, pack_response
-from .tx_trade_bridge import TxTradeBridge
+from .tx_trade_bridge import ACCOUNT_DETAIL_RAW_FIELDS, TxTradeBridge
 
 
 class NormalQmtBridge(TxTradeBridge):
@@ -24,6 +25,7 @@ class NormalQmtBridge(TxTradeBridge):
         globals_dict=None,
         pump_max_count=20,
         pump_max_ms=10,
+        internal_whole_quote_enabled=None,
     ):
         super(NormalQmtBridge, self).__init__(
             context,
@@ -36,6 +38,8 @@ class NormalQmtBridge(TxTradeBridge):
             show=show,
             globals_dict=globals_dict,
         )
+        if globals_dict is not None:
+            self.globals_dict = globals_dict
         self.request_queue = queue.Queue(maxsize=10000)
         self.recv_thread = None
         self.worker_thread = None
@@ -44,6 +48,15 @@ class NormalQmtBridge(TxTradeBridge):
         self.worker_source_lock = threading.Lock()
         self.pump_max_count = int(pump_max_count)
         self.pump_max_ms = float(pump_max_ms)
+        if internal_whole_quote_enabled is None:
+            raw_whole_quote = os.environ.get("CFQUANT_INTERNAL_WHOLE_QUOTE", "1")
+            internal_whole_quote_enabled = str(raw_whole_quote).strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+        self.internal_whole_quote_enabled = bool(internal_whole_quote_enabled)
         self.subscription_seq = 0
         self.quote_subscriptions = {}
         self.whole_quote_publish_sub_id = None
@@ -52,6 +65,8 @@ class NormalQmtBridge(TxTradeBridge):
         self.schedule_key = None
         self.callback_event_channel = callback_event_channel
         self.bridge_id = bridge_id or "default"
+        self.callback_account_bound = False
+        self.callback_account_id = ""
 
     def start(self):
         if self.running:
@@ -71,16 +86,60 @@ class NormalQmtBridge(TxTradeBridge):
         return self
 
     def set_context(self, context):
+        self.callback_account_bound = False
+        self.callback_account_id = ""
+        configured_account_id = self._normalize_callback_account(self.account_id)
+        global_account_id = self._normalize_callback_account(self.globals_dict.get("account"))
+        if configured_account_id and global_account_id and configured_account_id != global_account_id:
+            self.context = None
+            self._log(
+                "normal bridge callback account binding conflict configured=%s global=%s"
+                % (configured_account_id, global_account_id)
+            )
+            raise ValueError(
+                "normal bridge callback account conflict: configured=%s global=%s"
+                % (configured_account_id, global_account_id)
+            )
+
+        account_id = configured_account_id or global_account_id
+        if account_id:
+            try:
+                context.set_account(account_id)
+            except Exception as e:
+                self.context = None
+                self._log(
+                    "normal bridge callback account bind failed account=%s error=%s"
+                    % (account_id, e)
+                )
+                raise
+            self.account_id = account_id
+            self.callback_account_bound = True
+            self.callback_account_id = account_id
+            self._log("normal bridge callback account bound account=%s" % account_id)
+        else:
+            self._log("normal bridge callback account not bound")
+
         self.context = context
-        self._subscribe_internal_whole_quote()
+        if self.internal_whole_quote_enabled:
+            self._subscribe_internal_whole_quote()
+        else:
+            self._log("normal bridge internal whole quote disabled; using direct quote subscriptions")
         self._start_worker_thread(context)
         self._schedule_timer()
         self._log("normal bridge worker is released by request/quote/timer/handlebar callbacks")
         self._log("normal bridge context ready")
 
+    @staticmethod
+    def _normalize_callback_account(value):
+        if value is None:
+            return ""
+        return str(value).strip()
+
     def close(self):
         self.running = False
         self.worker_event.set()
+        self.callback_account_bound = False
+        self.callback_account_id = ""
         if self.context is not None and self.schedule_key:
             try:
                 self.context.cancel_schedule_run(self.schedule_key)
@@ -112,12 +171,20 @@ class NormalQmtBridge(TxTradeBridge):
             self._send_response(msg, self._status())
             return
         if action == "xtdata.subscribe_whole_quote":
-            self._handle_whole_quote_publish_subscribe(msg)
+            if self.internal_whole_quote_enabled:
+                self._handle_whole_quote_publish_subscribe(msg)
+            else:
+                self._send_error(
+                    msg,
+                    RuntimeError(
+                        "whole quote is disabled by CFQUANT_INTERNAL_WHOLE_QUOTE=0"
+                    ),
+                )
             return
-        if action == "xtdata.subscribe_quote":
+        if action == "xtdata.subscribe_quote" and self.internal_whole_quote_enabled:
             self._handle_quote_subscribe(msg, kind="quote")
             return
-        if action == "xtdata.unsubscribe_quote":
+        if action == "xtdata.unsubscribe_quote" and self.internal_whole_quote_enabled:
             self._handle_quote_unsubscribe(msg)
             return
         try:
@@ -277,7 +344,11 @@ class NormalQmtBridge(TxTradeBridge):
         self._release_worker("timer")
 
     def _subscribe_internal_whole_quote(self):
-        if self.context is None or self.whole_quote_sub_id:
+        if (
+            not self.internal_whole_quote_enabled
+            or self.context is None
+            or self.whole_quote_sub_id
+        ):
             return
         try:
             self.whole_quote_sub_id = self.context.subscribe_whole_quote(["SH", "SZ"], callback=self._on_whole_quote)
@@ -355,6 +426,8 @@ class NormalQmtBridge(TxTradeBridge):
             "m_nVolume",
             "m_nCanUseVolume",
             "m_dPrice",
+            "m_nOrderPriceType",
+            "m_dLimitPrice",
             "m_dTradedPrice",
             "m_dTradeAmount",
             "m_dBalance",
@@ -370,10 +443,13 @@ class NormalQmtBridge(TxTradeBridge):
             "m_strOrderID",
             "m_nOrderID",
             "m_nOrderStatus",
+            "m_strInsertDate",
+            "m_strInsertTime",
             "m_strOrderStatus",
             "m_nOrderState",
             "m_strStatusMsg",
         ]
+        fields.extend(ACCOUNT_DETAIL_RAW_FIELDS)
         data = {}
         for field in fields:
             value = self._get_value(obj, field)
@@ -406,8 +482,11 @@ class NormalQmtBridge(TxTradeBridge):
             "quote_subscription_count": len(self.quote_subscriptions),
             "whole_quote_publish_enabled": self.whole_quote_publish_enabled,
             "whole_quote_publish_sub_id": self.whole_quote_publish_sub_id,
+            "internal_whole_quote_enabled": self.internal_whole_quote_enabled,
             "pump_max_count": self.pump_max_count,
             "pump_max_ms": self.pump_max_ms,
+            "callback_account_bound": self.callback_account_bound,
+            "callback_account_id": self.callback_account_id,
         }
 
 
@@ -421,6 +500,7 @@ def start_normal_bridge(
     bridge_id="default",
     account_id="",
     show=True,
+    internal_whole_quote_enabled=None,
 ):
     import sys
 
@@ -439,4 +519,5 @@ def start_normal_bridge(
         account_id=account_id,
         show=show,
         globals_dict=globals_dict,
+        internal_whole_quote_enabled=internal_whole_quote_enabled,
     ).start()

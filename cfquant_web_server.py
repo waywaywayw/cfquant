@@ -2122,12 +2122,14 @@ class ChannelStatusMonitor(object):
         self._thread = None
         self._running = False
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
 
     def start(self):
         if self._running:
             return
         self._running = True
         self._stop_event.clear()
+        self._wake_event.clear()
         self._thread = threading.Thread(target=self._loop)
         self._thread.daemon = True
         self._thread.start()
@@ -2136,9 +2138,10 @@ class ChannelStatusMonitor(object):
     def close(self):
         self._running = False
         self._stop_event.set()
+        self._wake_event.set()
 
     def wake(self):
-        self._stop_event.set()
+        self._wake_event.set()
 
     def forget(self, bridge_id):
         bridge_id = normalize_bridge_id(bridge_id)
@@ -2202,7 +2205,8 @@ class ChannelStatusMonitor(object):
                 safe_print("channel status monitor probe failed: %s" % e)
             elapsed = time.time() - started
             delay = max(0.5, self.interval - elapsed)
-            self._stop_event.wait(delay)
+            self._wake_event.wait(delay)
+            self._wake_event.clear()
 
 
 STATUS_MONITOR = ChannelStatusMonitor()
