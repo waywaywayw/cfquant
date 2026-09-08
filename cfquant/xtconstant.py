@@ -25,6 +25,13 @@ ACCOUNT_TYPE_DICT = {
 
 STOCK_BUY = 23
 STOCK_SELL = 24
+# QMT keeps the SDK credit buy/sell constants numerically aligned with the
+# stock constants. The account type, not the value alone, gives them their
+# collateral semantics; the bridge converts them to passorder 33/34.
+CREDIT_BUY = 23
+CREDIT_SELL = 24
+CREDIT_FIN_BUY = 27
+CREDIT_SLO_SELL = 28
 
 FIX_PRICE = 11
 LATEST_PRICE = 5
@@ -69,4 +76,3 @@ ACCOUNT_STATUS_WAITING_LOGIN = 1
 ACCOUNT_STATUSING = 2
 ACCOUNT_STATUS_FAIL = 3
 ACCOUNT_STATUS_INVALID = -1
-

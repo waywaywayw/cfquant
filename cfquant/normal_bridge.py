@@ -10,6 +10,15 @@ from .protocol import loads_message, pack_event, pack_response
 from .tx_trade_bridge import ACCOUNT_DETAIL_RAW_FIELDS, TxTradeBridge
 
 
+CALLBACK_ACCOUNT_FIELDS = (
+    "account_id",
+    "m_strAccountID",
+    "m_strAccountId",
+    "m_strAccount",
+    "m_accountID",
+)
+
+
 class NormalQmtBridge(TxTradeBridge):
     def __init__(
         self,
@@ -26,6 +35,9 @@ class NormalQmtBridge(TxTradeBridge):
         pump_max_count=20,
         pump_max_ms=10,
         internal_whole_quote_enabled=None,
+        account_locked=False,
+        account_type=2,
+        callback_publisher=None,
     ):
         super(NormalQmtBridge, self).__init__(
             context,
@@ -37,6 +49,9 @@ class NormalQmtBridge(TxTradeBridge):
             account_id=account_id,
             show=show,
             globals_dict=globals_dict,
+            account_locked=account_locked,
+            account_type=account_type,
+            callback_publisher=callback_publisher,
         )
         if globals_dict is not None:
             self.globals_dict = globals_dict
@@ -68,6 +83,64 @@ class NormalQmtBridge(TxTradeBridge):
         self.callback_account_bound = False
         self.callback_account_id = ""
 
+    @classmethod
+    def for_callback_publisher(
+        cls,
+        trade_bridge,
+        callback_event_channel="cfquant.callback.event",
+        bridge_id=None,
+        account_id="",
+        show=None,
+        globals_dict=None,
+    ):
+        """Attach callback serialization to an already running trade bridge."""
+        if trade_bridge is None:
+            raise ValueError("trade bridge is required")
+        if trade_bridge.tx is None:
+            raise RuntimeError("trade bridge transport is not ready")
+        if bridge_id is None:
+            bridge_id = trade_bridge.bridge_id
+        elif trade_bridge.account_locked and str(bridge_id).strip() != str(trade_bridge.bridge_id).strip():
+            raise ValueError("callback publisher bridge_id must match trade bridge")
+        if not account_id:
+            account_id = trade_bridge.account_id
+        elif trade_bridge.account_locked and str(account_id).strip() != str(trade_bridge.account_id).strip():
+            raise ValueError("callback publisher account_id must match trade bridge")
+        if (
+            trade_bridge.account_locked
+            and getattr(trade_bridge, "callback_publisher", None) is not None
+        ):
+            raise ValueError("trade bridge already has a callback publisher")
+        if show is None:
+            show = trade_bridge.show
+        if globals_dict is None:
+            globals_dict = trade_bridge.globals_dict
+
+        publisher = cls(
+            trade_bridge.context,
+            ip=trade_bridge.ip,
+            port=trade_bridge.port,
+            token=trade_bridge.token,
+            request_channel=trade_bridge.request_channel,
+            callback_event_channel=callback_event_channel,
+            bridge_id=bridge_id,
+            account_id=account_id,
+            show=show,
+            globals_dict=globals_dict,
+            internal_whole_quote_enabled=False,
+            account_locked=trade_bridge.account_locked,
+            account_type=trade_bridge.account_type,
+        )
+        # The low-latency bridge owns this connection. Only reuse its transport
+        # and account subscriber state; never start or close a second bridge.
+        publisher.tx = trade_bridge.tx
+        publisher.account_subscribers = trade_bridge.account_subscribers
+        publisher.subscriber_lock = trade_bridge.subscriber_lock
+        publisher._transport_owner = False
+        publisher._trade_bridge = trade_bridge
+        trade_bridge.callback_publisher = publisher
+        return publisher
+
     def start(self):
         if self.running:
             return self
@@ -86,6 +159,18 @@ class NormalQmtBridge(TxTradeBridge):
         return self
 
     def set_context(self, context):
+        self.bind_callback_account(context)
+        self.context = context
+        if self.internal_whole_quote_enabled:
+            self._subscribe_internal_whole_quote()
+        else:
+            self._log("normal bridge internal whole quote disabled; using direct quote subscriptions")
+        self._start_worker_thread(context)
+        self._schedule_timer()
+        self._log("normal bridge worker is released by request/quote/timer/handlebar callbacks")
+        self._log("normal bridge context ready")
+
+    def bind_callback_account(self, context):
         self.callback_account_bound = False
         self.callback_account_id = ""
         configured_account_id = self._normalize_callback_account(self.account_id)
@@ -115,19 +200,10 @@ class NormalQmtBridge(TxTradeBridge):
             self.account_id = account_id
             self.callback_account_bound = True
             self.callback_account_id = account_id
+            self.context = context
             self._log("normal bridge callback account bound account=%s" % account_id)
         else:
             self._log("normal bridge callback account not bound")
-
-        self.context = context
-        if self.internal_whole_quote_enabled:
-            self._subscribe_internal_whole_quote()
-        else:
-            self._log("normal bridge internal whole quote disabled; using direct quote subscriptions")
-        self._start_worker_thread(context)
-        self._schedule_timer()
-        self._log("normal bridge worker is released by request/quote/timer/handlebar callbacks")
-        self._log("normal bridge context ready")
 
     @staticmethod
     def _normalize_callback_account(value):
@@ -145,7 +221,14 @@ class NormalQmtBridge(TxTradeBridge):
                 self.context.cancel_schedule_run(self.schedule_key)
             except Exception:
                 pass
-        super(NormalQmtBridge, self).close()
+        if self._transport_owner:
+            super(NormalQmtBridge, self).close()
+        else:
+            trade_bridge = getattr(self, "_trade_bridge", None)
+            if trade_bridge is not None and getattr(trade_bridge, "callback_publisher", None) is self:
+                trade_bridge.callback_publisher = None
+            self._trade_bridge = None
+            self.tx = None
 
     def _recv_loop(self):
         while self.running:
@@ -395,6 +478,9 @@ class NormalQmtBridge(TxTradeBridge):
             return
         data = self._callback_object_to_dict(obj)
         account_id = self._callback_account_id(obj, data)
+        if account_id is None:
+            self._log("normal bridge callback event dropped due to account identity")
+            return
         payload = {
             "type": "event",
             "event": event_name,
@@ -448,6 +534,43 @@ class NormalQmtBridge(TxTradeBridge):
             "m_strOrderStatus",
             "m_nOrderState",
             "m_strStatusMsg",
+            "m_nOrderType",
+            "m_nOperationType",
+            "m_nDirection",
+            "m_nPriceType",
+            "m_strTradeID",
+            "m_strDealID",
+            "m_nTradeID",
+            "m_nDealID",
+            "m_strTradeTime",
+            "m_strDealTime",
+            "m_nTradeTime",
+            "m_nDealTime",
+            "m_strTradeDate",
+            "m_strDealDate",
+            "m_nTradeDate",
+            "m_nDealDate",
+            "m_strTradingDay",
+            "m_strOrderDate",
+            "m_strOrderTime",
+            "m_strEntrustDate",
+            "m_strEntrustTime",
+            "m_nOrderDate",
+            "m_nOrderTime",
+            "m_nEntrustDate",
+            "m_nEntrustTime",
+            "account_type",
+            "m_nAccountType",
+            "order_id",
+            "order_sysid",
+            "trade_id",
+            "traded_id",
+            "deal_id",
+            "broker_operation_code",
+            "operation_code",
+            "order_type",
+            "optype",
+            "credit_operation",
         ]
         fields.extend(ACCOUNT_DETAIL_RAW_FIELDS)
         data = {}
@@ -462,15 +585,40 @@ class NormalQmtBridge(TxTradeBridge):
         return data
 
     def _callback_account_id(self, obj, data):
-        for key in ("account_id", "m_strAccountID", "m_strAccountId", "m_strAccount", "m_accountID"):
-            value = data.get(key)
-            if value:
-                return str(value).strip()
-        for name in ("account_id", "m_strAccountID", "m_strAccountId", "m_strAccount", "m_accountID"):
+        if not self.account_locked:
+            for name in CALLBACK_ACCOUNT_FIELDS:
+                value = data.get(name)
+                if value:
+                    return str(value).strip()
+            for name in CALLBACK_ACCOUNT_FIELDS:
+                value = self._get_value(obj, name)
+                if value:
+                    return str(value).strip()
+            return str(self.account_id or "").strip()
+
+        identities = []
+        for name in CALLBACK_ACCOUNT_FIELDS:
+            value = data.get(name)
+            if value not in (None, ""):
+                identities.append((name, str(value).strip()))
             value = self._get_value(obj, name)
-            if value:
-                return str(value).strip()
-        return str(self.account_id or "").strip()
+            if value not in (None, ""):
+                identities.append((name, str(value).strip()))
+        values = set(value for _, value in identities if value)
+        if len(values) > 1:
+            return None
+
+        if self.account_locked:
+            if not self.callback_account_bound:
+                return None
+            bound_account = str(self.callback_account_id or "").strip()
+            if not bound_account or bound_account != str(self.account_id or "").strip():
+                return None
+            if values and values != {bound_account}:
+                return None
+            if not values:
+                data["account_id"] = bound_account
+            return bound_account
 
     def _status_extra(self):
         return {
@@ -501,6 +649,9 @@ def start_normal_bridge(
     account_id="",
     show=True,
     internal_whole_quote_enabled=None,
+    account_locked=False,
+    account_type=2,
+    callback_publisher=None,
 ):
     import sys
 
@@ -520,4 +671,7 @@ def start_normal_bridge(
         show=show,
         globals_dict=globals_dict,
         internal_whole_quote_enabled=internal_whole_quote_enabled,
+        account_locked=account_locked,
+        account_type=account_type,
+        callback_publisher=callback_publisher,
     ).start()

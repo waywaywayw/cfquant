@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import math
 import os
 import sys
 import threading
@@ -43,6 +44,51 @@ XTTRADER_COMPAT_CANDIDATES = {
     "smt_compact_renewal": ("smt_compact_renewal",),
 }
 
+
+CREDIT_QUERY_NATIVE_METHODS = {
+    "query_credit_detail": "get_trade_detail_data",
+    "query_credit_subjects": "get_assure_contract",
+    "query_credit_assure": "get_assure_contract",
+    "query_credit_slo_code": "get_enable_short_contract",
+    "query_stk_compacts": "get_unclosed_compacts",
+}
+CREDIT_NATIVE_METHODS = {
+    "get_trade_detail_data",
+    "get_assure_contract",
+    "get_enable_short_contract",
+    "get_unclosed_compacts",
+    "get_closed_compacts",
+}
+_CREDIT_UNAVAILABLE = object()
+
+ACCOUNT_TYPE_CODES = {
+    1: "FUTURE",
+    2: "STOCK",
+    3: "CREDIT",
+    5: "FUTURE_OPTION",
+    6: "STOCK_OPTION",
+    7: "HUGANGTONG",
+    8: "INCOME_SWAP",
+    10: "NEW3BOARD",
+    11: "SHENGANGTONG",
+}
+ACCOUNT_TYPE_NAMES = dict((name, code) for code, name in ACCOUNT_TYPE_CODES.items())
+ACCOUNT_TYPE_NAMES.update({
+    "SECURITY": 2,
+    "STOCK_ACCOUNT": 2,
+    "CREDIT_ACCOUNT": 3,
+})
+CREDIT_OPERATION_CODES = frozenset(range(27, 35))
+ACCOUNT_ID_FIELDS = (
+    "account_id",
+    "m_strAccountID",
+    "m_strAccountId",
+    "m_strAccount",
+    "m_accountID",
+)
+ACCOUNT_TYPE_FIELDS = ("account_type", "m_nAccountType")
+BRIDGE_ID_FIELDS = ("bridge_id", "qmt_bridge_id")
+
 # QMT's embedded account object contains a wider asset breakdown than the
 # six fields historically forwarded by cfquant. Keep the raw names alongside
 # stable aliases so broker-specific assets such as reverse repos are not lost.
@@ -82,6 +128,9 @@ class TxTradeBridge(object):
         account_id="",
         show=True,
         globals_dict=None,
+        account_locked=False,
+        account_type=2,
+        callback_publisher=None,
     ):
         self.context = context
         self.ip = ip
@@ -89,7 +138,17 @@ class TxTradeBridge(object):
         self.token = token
         self.request_channel = request_channel
         self.bridge_id = bridge_id or "default"
-        self.account_id = account_id
+        self.account_locked = bool(account_locked)
+        if self.account_locked:
+            self.account_id = self._normalize_account_id(account_id, "locked bridge account_id")
+            self.account_type = self._normalize_account_type_code(account_type)
+            self._locked_account_id = self.account_id
+            self._locked_account_type = self.account_type
+        else:
+            self.account_id = account_id
+            self.account_type = account_type
+            self._locked_account_id = ""
+            self._locked_account_type = None
         self.show = show
         self.globals_dict = globals_dict or {}
         self.running = False
@@ -102,6 +161,8 @@ class TxTradeBridge(object):
         self.subscriptions = {}
         self.client_subscriptions = {}
         self.subscriber_lock = threading.RLock()
+        self.callback_publisher = callback_publisher
+        self._transport_owner = True
 
     def set_context(self, context):
         self.context = context
@@ -123,6 +184,15 @@ class TxTradeBridge(object):
 
     def close(self):
         self.running = False
+        publisher = self.callback_publisher
+        self.callback_publisher = None
+        if publisher is not None and publisher is not self:
+            on_close = getattr(publisher, "_on_trade_bridge_closed", None)
+            if callable(on_close):
+                on_close()
+        if not self._transport_owner:
+            self.tx = None
+            return
         unsubscribe_quote = self._get_callable("unsubscribe_quote")
         for subscribe_id in list(self.subscriptions):
             try:
@@ -259,12 +329,17 @@ class TxTradeBridge(object):
             "running": self.running,
             "request_channel": self.request_channel,
             "account_id": self.account_id,
+            "account_locked": self.account_locked,
+            "account_type": self.account_type,
+            "account_type_name": self._account_type_name(self.account_type).upper(),
             "account_subscribers": self._account_subscriber_status(),
             "context_ready": self.context is not None,
             "tx_ready": self.tx is not None,
             "subscriptions": len(self.subscriptions),
             "ts": time.time(),
         }
+        callback_status = self._callback_publisher_status()
+        status.update(callback_status)
         try:
             extra = self._status_extra()
             if extra:
@@ -275,6 +350,161 @@ class TxTradeBridge(object):
 
     def _status_extra(self):
         return {}
+
+    def _callback_publisher_status(self):
+        publisher = self.callback_publisher
+        if publisher is None:
+            return {
+                "callback_account_bound": False,
+                "callback_account_id": "",
+                "callback_source": "",
+            }
+        valid = (
+            publisher is not self
+            and getattr(publisher, "tx", None) is self.tx
+            and getattr(publisher, "bridge_id", None) == self.bridge_id
+            and getattr(publisher, "account_locked", False) == self.account_locked
+            and getattr(publisher, "account_type", None) == self.account_type
+            and str(getattr(publisher, "account_id", "") or "").strip()
+            == str(self.account_id or "").strip()
+            and bool(getattr(publisher, "callback_account_bound", False))
+            and str(getattr(publisher, "callback_account_id", "") or "").strip()
+            == str(self.account_id or "").strip()
+        )
+        if not valid:
+            return {
+                "callback_account_bound": False,
+                "callback_account_id": "",
+                "callback_source": "",
+            }
+        return {
+            "callback_account_bound": True,
+            "callback_account_id": str(publisher.callback_account_id).strip(),
+            "callback_source": "trade_model",
+        }
+
+    def _on_trade_bridge_closed(self):
+        self.running = False
+        self.tx = None
+        self.callback_account_bound = False
+        self.callback_account_id = ""
+
+    def _normalize_account_id(self, value, label="account_id"):
+        if value is None or isinstance(value, bool) or isinstance(value, (dict, list, tuple, set)):
+            raise ValueError("%s must be non-empty" % label)
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("%s must be non-empty" % label)
+        return normalized
+
+    def _normalize_account_type_code(self, value):
+        if isinstance(value, bool):
+            raise ValueError("account_type must be a valid QMT account type")
+        if isinstance(value, int):
+            code = value
+        elif isinstance(value, str):
+            text = value.strip().upper()
+            if text.lstrip("+-").isdigit():
+                code = int(text)
+            else:
+                code = ACCOUNT_TYPE_NAMES.get(text)
+        else:
+            code = None
+        if code not in ACCOUNT_TYPE_CODES:
+            raise ValueError("account_type must be a valid QMT account type")
+        return code
+
+    def _identity_values(self, params, args=None, args_type_index=None, require_type=False):
+        if not isinstance(params, dict):
+            raise ValueError("%s params must be a dict" % (type(self).__name__,))
+        containers = []
+        account = params.get("account")
+        if account is not None:
+            if not isinstance(account, dict):
+                raise ValueError("account must be a dict")
+            containers.append(account)
+        containers.append(params)
+        account_ids = []
+        account_types = []
+        bridge_ids = []
+        for container in containers:
+            for name in ACCOUNT_ID_FIELDS:
+                value = container.get(name)
+                if value not in (None, ""):
+                    account_ids.append((name, self._normalize_account_id(value)))
+            for name in ACCOUNT_TYPE_FIELDS:
+                value = container.get(name)
+                if value not in (None, ""):
+                    account_types.append((name, value))
+            for name in BRIDGE_ID_FIELDS:
+                value = container.get(name)
+                if value not in (None, ""):
+                    bridge_ids.append((name, str(value).strip()))
+
+        if args is not None:
+            if not isinstance(args, (list, tuple)) or not args:
+                raise ValueError("native args must include account_id")
+            account_ids.append(("args[0]", self._normalize_account_id(args[0])))
+            if args_type_index is not None and len(args) > args_type_index:
+                value = args[args_type_index]
+                if value not in (None, ""):
+                    account_types.append(("args[%s]" % args_type_index, value))
+
+        if self.account_locked:
+            if not account_ids:
+                raise ValueError("locked bridge requires explicit account_id")
+            normalized_ids = set(value for _, value in account_ids)
+            if len(normalized_ids) > 1:
+                raise ValueError("conflicting account_id declarations")
+            if normalized_ids != {self._locked_account_id}:
+                raise ValueError("locked bridge account_id mismatch")
+            if require_type and not account_types:
+                raise ValueError("locked bridge requires explicit account_type")
+            try:
+                type_codes = set(self._normalize_account_type_code(value) for _, value in account_types)
+            except ValueError as exc:
+                raise ValueError("locked bridge requires a valid account_type") from exc
+            if len(type_codes) > 1:
+                raise ValueError("conflicting account_type declarations")
+            if type_codes and type_codes != {self._locked_account_type}:
+                raise ValueError("locked bridge account_type mismatch")
+            for _, value in bridge_ids:
+                if str(value).strip() != str(self.bridge_id).strip():
+                    raise ValueError("locked bridge bridge_id mismatch")
+            return (
+                self._locked_account_id,
+                ACCOUNT_TYPE_CODES[self._locked_account_type],
+                self._locked_account_type,
+                True,
+                bool(account_types),
+            )
+
+        account_id = account_ids[0][1] if account_ids else self.account_id
+        if not account_id:
+            raise ValueError("account_id is required")
+        declared_type = account_types[0][1] if account_types else self.account_type
+        try:
+            type_code = self._normalize_account_type_code(declared_type)
+        except ValueError:
+            type_code = None
+        type_name = (
+            ACCOUNT_TYPE_CODES[type_code]
+            if type_code is not None
+            else self._account_type_name(declared_type).upper()
+        )
+        return account_id, type_name, type_code, bool(account_ids), bool(account_types)
+
+    def _validate_result_account(self, row, account_id):
+        returned = []
+        for name in ACCOUNT_ID_FIELDS:
+            value = self._get_value(row, name)
+            if value not in (None, ""):
+                returned.append(self._normalize_account_id(value, "returned account_id"))
+        if returned and any(value != account_id for value in returned):
+            raise ValueError(
+                "result account mismatch requested=%s returned=%s"
+                % (account_id, sorted(set(returned)))
+            )
 
     def _cleanup_qmt_userdata_logs(self, params):
         params = params or {}
@@ -375,14 +605,13 @@ class TxTradeBridge(object):
         }
 
     def _query_trade_detail(self, params, detail_type):
+        account_id, account_type, account_type_code, _, _ = self._identity_values(
+            params,
+            require_type=self.account_locked,
+        )
         func = self._get_callable("get_trade_detail_data")
         if not func:
             raise NotImplementedError("get_trade_detail_data not found")
-        account = params.get("account") or {}
-        account_id = account.get("account_id") or params.get("account_id") or self.account_id
-        if not account_id:
-            raise ValueError("account_id is required")
-        account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
         self._log(
             "query_trade_detail start account=%s account_type=%s detail_type=%s"
             % (account_id, account_type.lower(), detail_type.lower())
@@ -404,6 +633,8 @@ class TxTradeBridge(object):
         result = []
         for index, row in enumerate(rows):
             try:
+                if self.account_locked:
+                    self._validate_result_account(row, account_id)
                 result.append(self._format_trade_detail(row, detail_type, account_id=account_id))
             except Exception as e:
                 self._log(
@@ -477,16 +708,41 @@ class TxTradeBridge(object):
         return result
 
     def _order_stock(self, params, msg):
+        account_id, account_type, account_type_code, has_account_id, _ = self._identity_values(
+            params,
+            require_type=self.account_locked,
+        )
+        is_credit_account = account_type_code == 3 or account_type == "CREDIT"
+        if is_credit_account and not has_account_id:
+            raise ValueError("credit order requires an explicit account_id")
+        if "optype" in params and "order_type" in params:
+            first_order_type = self._normalize_order_type(params.get("optype"))
+            second_order_type = self._normalize_order_type(params.get("order_type"))
+            if first_order_type != second_order_type:
+                raise ValueError("conflicting order_type declarations")
+            order_type = first_order_type
+        elif "optype" in params:
+            order_type = self._normalize_order_type(params.get("optype"))
+        elif "order_type" in params:
+            order_type = self._normalize_order_type(params.get("order_type"))
+        else:
+            raise ValueError("order_type is required before passorder")
+        if is_credit_account:
+            account_id = self._normalize_credit_account_id(account_id)
+
+        if order_type in CREDIT_OPERATION_CODES and not is_credit_account:
+            raise ValueError(
+                "credit operation code %s requires explicit CREDIT account type" % order_type
+            )
+        if is_credit_account:
+            if order_type == 23:
+                order_type = 33
+            elif order_type == 24:
+                order_type = 34
+
         passorder = self._get_callable("passorder")
         if not passorder:
             raise NotImplementedError("passorder not found")
-        account = params.get("account") or {}
-        account_id = account.get("account_id") or params.get("account_id") or self.account_id
-        order_type = params.get("optype", params.get("order_type"))
-        if not account_id:
-            raise ValueError("account_id is required")
-        if isinstance(order_type, str):
-            order_type = 23 if order_type.lower() == "buy" else 24
         price_type = params.get("price_type", 11)
         order_remark = params.get("order_remark", msg.get("id", "tx_order"))
         qmt_order_type = params.get("qmt_order_type", 1101)
@@ -544,6 +800,7 @@ class TxTradeBridge(object):
                 order_remark,
                 strategy_name,
                 params.get("find_order_wait", 2.0),
+                account_type,
             )
         return {"request_result": result, "order_id": order_id, "order_remark": order_remark}
 
@@ -560,13 +817,26 @@ class TxTradeBridge(object):
         self._send_trader_event(msg.get("client_id"), "on_order_stock_async_response", data)
         return result
 
+    def _validate_order_type_before_submit(self, params):
+        if "optype" in params and "order_type" in params:
+            first = self._normalize_order_type(params.get("optype"))
+            second = self._normalize_order_type(params.get("order_type"))
+            if first != second:
+                raise ValueError("conflicting order_type declarations")
+            return first
+        if "optype" in params:
+            return self._normalize_order_type(params.get("optype"))
+        if "order_type" in params:
+            return self._normalize_order_type(params.get("order_type"))
+        raise ValueError("order_type is required before passorder")
+
     def _order_stock_batch(self, params, msg):
         orders = params.get("orders") or []
         if not isinstance(orders, list) or not orders:
             raise ValueError("orders must be a non-empty list")
         common_account = params.get("account") or {}
         stop_on_error = bool(params.get("stop_on_error"))
-        results = []
+        prepared = []
         for index, order in enumerate(orders):
             row = dict(params)
             row.pop("orders", None)
@@ -575,6 +845,17 @@ class TxTradeBridge(object):
                 row["account"] = common_account
             if not row.get("order_remark"):
                 row["order_remark"] = "%s_%s" % (params.get("order_remark") or msg.get("id", "batch_order"), index + 1)
+            order_type = self._validate_order_type_before_submit(row)
+            if self.account_locked:
+                self._identity_values(row, require_type=True)
+                _, account_type, account_type_code, _, _ = self._identity_values(row, require_type=True)
+                if order_type in CREDIT_OPERATION_CODES and account_type_code != 3:
+                    raise ValueError(
+                        "credit operation code %s requires explicit CREDIT account type" % order_type
+                    )
+            prepared.append(row)
+        results = []
+        for index, row in enumerate(prepared):
             try:
                 result = self._order_stock(row, msg)
                 results.append({
@@ -600,18 +881,26 @@ class TxTradeBridge(object):
         }
 
     def _cancel_order_stock(self, params):
+        account_id, account_type, _, _, _ = self._identity_values(
+            params,
+            require_type=self.account_locked,
+        )
         cancel_func = self._get_callable("cancel")
         if not cancel_func:
             raise NotImplementedError("cancel not found")
-        account = params.get("account") or {}
-        account_id = account.get("account_id") or params.get("account_id") or self.account_id
         order_id = str(params.get("order_id", ""))
-        if not account_id:
-            raise ValueError("account_id is required")
         if not order_id:
             raise ValueError("order_id is required")
-        account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        order = self._find_order_for_cancel(account_id, account_type, order_id)
+        if self.account_locked:
+            native_account_type = account_type
+        else:
+            # Keep the unlocked bridge's historical native-type spelling. The
+            # identity validator normalizes only its internal comparison value;
+            # QMT callers may still rely on an explicitly supplied ``STOCK``.
+            account = params.get("account") or {}
+            declared_account_type = account.get("account_type") or params.get("account_type")
+            native_account_type = self._account_type_name(declared_account_type)
+        order = self._find_order_for_cancel(account_id, native_account_type, order_id)
         status = self._get_value(order, "order_status") if order else None
         try:
             status_code = int(status)
@@ -625,7 +914,7 @@ class TxTradeBridge(object):
                 "reason": "order_not_active_or_status_unknown",
                 "order_status": status,
             }
-        result = cancel_func(order_id, account_id, account_type, self.context)
+        result = cancel_func(order_id, account_id, native_account_type, self.context)
         return {"cancel_result": 0 if result else -1, "request_result": result, "order_id": order_id}
 
     def _find_order_for_cancel(self, account_id, account_type, order_id):
@@ -681,6 +970,10 @@ class TxTradeBridge(object):
 
     def _dispatch_xttrader_compat(self, action, params, msg):
         method = action.split(".", 1)[1]
+        if method in CREDIT_QUERY_NATIVE_METHODS:
+            return self._dispatch_credit_query(method, params)
+        if method in CREDIT_NATIVE_METHODS:
+            return self._dispatch_credit_native(method, params)
         if method == "query_com_fund":
             rows = self._query_trade_detail(params, "account")
             return rows[0] if rows else {}
@@ -696,7 +989,368 @@ class TxTradeBridge(object):
             return self._query_trade_detail(params, "position")
         return self._generic_xttrader_call(method, params)
 
+    def _dispatch_credit_query(self, method, params):
+        self._validate_credit_query_params(params)
+        account_id = self._require_credit_account(params)
+        self._validate_optional_credit_account(params, account_id)
+        native_name = CREDIT_QUERY_NATIVE_METHODS[method]
+        func = self._get_callable(native_name)
+        if not func:
+            raise NotImplementedError(
+                "xttrader.%s requires QMT callable: %s" % (method, native_name)
+            )
+
+        if method == "query_credit_detail":
+            result = func(account_id, "credit", "account")
+        elif method in ("query_credit_subjects", "query_credit_assure"):
+            result = func(account_id)
+        elif method == "query_credit_slo_code":
+            result = func(account_id)
+        else:
+            result = func(account_id, "CREDIT")
+        return self._format_credit_result(result, account_id, native_name)
+
+    def _validate_credit_query_params(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("credit query params must be a dict")
+        args = params.get("args")
+        if args not in (None, [], ()):
+            raise ValueError("credit query does not accept positional args")
+        kwargs = params.get("kwargs")
+        if kwargs not in (None, {}):
+            raise ValueError("credit query does not accept kwargs")
+
+    def _dispatch_credit_native(self, method, params):
+        if not isinstance(params, dict):
+            raise ValueError("credit query params must be a dict")
+        if method == "get_trade_detail_data":
+            args = params.get("args")
+            if not self._is_credit_account_detail_request(args, params):
+                return self._generic_xttrader_call(method, params)
+            account_id, call_args = self._validate_credit_native_args(method, args, params)
+        else:
+            account_id, call_args = self._validate_credit_native_args(
+                method, params.get("args"), params
+            )
+
+        func = self._get_callable(method)
+        if not func:
+            raise NotImplementedError("xttrader.%s requires QMT callable: %s" % (method, method))
+        result = func(*call_args)
+        return self._format_credit_result(result, account_id, method)
+
+    def _require_credit_account(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("credit query params must be a dict")
+        if self.account_locked:
+            self._identity_values(params, require_type=True)
+        account = params.get("account")
+        if not isinstance(account, dict):
+            raise ValueError("credit query requires explicit account dict")
+        account_id = self._normalize_credit_account_id(account.get("account_id"))
+        if not self._is_credit_account_type(account.get("account_type")):
+            raise ValueError("credit query requires account.account_type=3/CREDIT")
+        return account_id
+
+    def _validate_credit_native_args(self, method, args, params):
+        if not isinstance(args, (list, tuple)):
+            raise ValueError("xttrader.%s requires positional args" % method)
+        expected_count = {
+            "get_trade_detail_data": 3,
+            "get_assure_contract": 1,
+            "get_enable_short_contract": 1,
+            "get_unclosed_compacts": 2,
+            "get_closed_compacts": 2,
+        }[method]
+        if len(args) != expected_count:
+            raise ValueError(
+                "xttrader.%s requires exactly %s positional args" % (method, expected_count)
+            )
+
+        self._identity_values(
+            params,
+            args=args,
+            args_type_index=(
+                1
+                if method in ("get_trade_detail_data", "get_unclosed_compacts", "get_closed_compacts")
+                else None
+            ),
+            require_type=self.account_locked,
+        )
+
+        account_id = self._normalize_credit_account_id(args[0])
+        if method == "get_trade_detail_data":
+            if not self._is_credit_account_type(args[1]):
+                raise ValueError("get_trade_detail_data credit account type must be 3/CREDIT")
+            if self._normalize_credit_detail_type(args[2]) != "account":
+                raise ValueError("get_trade_detail_data credit detail type must be ACCOUNT")
+        elif method in ("get_unclosed_compacts", "get_closed_compacts"):
+            if not self._is_credit_account_type(args[1]):
+                raise ValueError("%s requires CREDIT account type" % method)
+
+        kwargs = params.get("kwargs")
+        if kwargs not in (None, {}):
+            raise ValueError("xttrader.%s does not accept kwargs" % method)
+        self._validate_optional_credit_account(params, account_id)
+        return account_id, self._canonical_credit_native_args(method, args, account_id)
+
+    def _canonical_credit_native_args(self, method, args, account_id):
+        if method == "get_trade_detail_data":
+            return (account_id, "CREDIT", "ACCOUNT")
+        if method in ("get_assure_contract", "get_enable_short_contract"):
+            return (account_id,)
+        return (account_id, "CREDIT")
+
+    def _normalize_order_type(self, value):
+        if isinstance(value, bool):
+            raise ValueError("order_type must be an integer, buy, or sell")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            lowered = text.lower()
+            if lowered == "buy":
+                return 23
+            if lowered == "sell":
+                return 24
+            if text and text.lstrip("+-").isdigit():
+                return int(text)
+        raise ValueError("order_type must be an integer, buy, or sell")
+
+    def _order_account_type_name(self, account_type):
+        if self._is_credit_account_type(account_type):
+            return "CREDIT"
+        if account_type in (None, ""):
+            return "STOCK"
+        if isinstance(account_type, str):
+            text = account_type.strip()
+            if text.lower() in ("2", "stock"):
+                return "STOCK"
+            return text.upper()
+        return self._account_type_name(account_type).upper()
+
+    def _validate_optional_credit_account(self, params, account_id):
+        if "account" in params:
+            declared_id = self._require_credit_account(params)
+            if declared_id != account_id:
+                raise ValueError(
+                    "credit query account mismatch args=%s account=%s"
+                    % (account_id, declared_id)
+                )
+        if "account_id" in params and params.get("account_id") not in (None, ""):
+            declared_id = self._normalize_credit_account_id(params.get("account_id"))
+            if declared_id != account_id:
+                raise ValueError(
+                    "credit query account mismatch args=%s account_id=%s"
+                    % (account_id, declared_id)
+                )
+        if "account_type" in params and params.get("account_type") not in (None, ""):
+            if not self._is_credit_account_type(params.get("account_type")):
+                raise ValueError("credit query requires account_type=3/CREDIT")
+
+    def _is_credit_account_detail_request(self, args, params):
+        if isinstance(args, (list, tuple)) and len(args) >= 2:
+            if not self._is_credit_account_type(args[1]):
+                return False
+            if len(args) == 3 and self._normalize_credit_detail_type(args[2]) in {
+                "position",
+                "order",
+                "deal",
+            }:
+                return False
+            return True
+        account = (params or {}).get("account")
+        return isinstance(account, dict) and self._is_credit_account_type(account.get("account_type"))
+
+    def _format_credit_result(self, result, account_id, native_name):
+        if result is None:
+            raise RuntimeError(
+                "credit query %s returned None for account=%s" % (native_name, account_id)
+            )
+        if not isinstance(result, (list, tuple)):
+            raise RuntimeError(
+                "credit query %s must return a list, got %s"
+                % (native_name, type(result).__name__)
+            )
+        if not result:
+            return []
+        formatted = []
+        for index, row in enumerate(result):
+            try:
+                formatted.append(self._format_credit_record(row, account_id, native_name))
+            except Exception as e:
+                raise RuntimeError(
+                    "credit query %s result[%s] conversion failed: %s"
+                    % (native_name, index, e)
+                )
+        return formatted
+
+    def _format_credit_record(self, row, account_id, native_name):
+        if row is None:
+            raise ValueError("result record is None")
+        if isinstance(row, dict):
+            fields = {}
+            for name, value in row.items():
+                converted = self._credit_plain_value(value)
+                if converted is not _CREDIT_UNAVAILABLE:
+                    fields[str(name)] = converted
+                elif str(name) in ("account_id", "m_strAccountID"):
+                    raise ValueError("account identity field is not serializable")
+            if not fields:
+                raise ValueError("result record has no serializable fields")
+        else:
+            fields = self._credit_object_fields(row)
+
+        self._validate_credit_record_account(fields, account_id)
+        self._add_credit_aliases(fields, account_id, native_name)
+        return fields
+
+    def _credit_object_fields(self, row):
+        try:
+            names = dir(row)
+        except Exception as e:
+            raise ValueError("result record attributes are not readable: %s" % e)
+
+        selected = set(name for name in names if str(name).startswith("m_"))
+        selected.update(name for name in ("account_id", "stock_code", "market") if name in names)
+        fields = {}
+        unreadable = []
+        for name in sorted(selected):
+            try:
+                value = getattr(row, name)
+            except Exception as e:
+                if name in ("account_id", "m_strAccountID"):
+                    raise ValueError("account identity field is not readable: %s" % e)
+                unreadable.append("%s: %s" % (name, e))
+                continue
+            if callable(value):
+                continue
+            converted = self._credit_plain_value(value)
+            if converted is _CREDIT_UNAVAILABLE:
+                if name in ("account_id", "m_strAccountID"):
+                    raise ValueError("account identity field is not serializable")
+                continue
+            fields[name] = converted
+        if not fields:
+            if unreadable:
+                raise ValueError("result record fields are not readable: %s" % ", ".join(unreadable))
+            raise ValueError("result record has no readable m_* fields")
+        return fields
+
+    def _validate_credit_record_account(self, fields, account_id):
+        for name in ("account_id", "m_strAccountID"):
+            if name not in fields:
+                continue
+            value = fields.get(name)
+            if value in (None, ""):
+                continue
+            record_id = self._normalize_credit_account_id(value)
+            if record_id != account_id:
+                raise ValueError(
+                    "result account mismatch requested=%s returned=%s"
+                    % (account_id, record_id)
+                )
+
+    def _add_credit_aliases(self, fields, account_id, native_name):
+        fields["account_id"] = account_id
+
+        market = fields.get("market")
+        if market in (None, ""):
+            market = fields.get("m_strExchangeID")
+        if market not in (None, ""):
+            fields["market"] = market
+
+        stock_code = fields.get("stock_code")
+        if stock_code in (None, ""):
+            instrument_id = fields.get("m_strInstrumentID")
+            if instrument_id not in (None, ""):
+                if market not in (None, ""):
+                    stock_code = "%s.%s" % (instrument_id, market)
+                else:
+                    stock_code = instrument_id
+        if stock_code not in (None, ""):
+            fields["stock_code"] = stock_code
+
+        if native_name == "get_enable_short_contract":
+            if "m_nEnableAmount" in fields:
+                fields["enable_amount"] = fields["m_nEnableAmount"]
+            if "m_eQuerySloType" in fields:
+                fields["query_slo_type"] = fields["m_eQuerySloType"]
+        elif native_name in ("get_unclosed_compacts", "get_closed_compacts"):
+            if "m_strCompactId" in fields:
+                fields["compact_id"] = fields["m_strCompactId"]
+            if "m_strEntrustNo" in fields:
+                fields["broker_order_id"] = fields["m_strEntrustNo"]
+
+    def _credit_plain_value(self, value):
+        if isinstance(value, str) and value.strip() == "<CanNotConvert>":
+            return _CREDIT_UNAVAILABLE
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return None
+            return value
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except Exception:
+                return str(value)
+        if isinstance(value, (list, tuple, set)):
+            converted = []
+            for item in value:
+                plain = self._credit_plain_value(item)
+                if plain is not _CREDIT_UNAVAILABLE:
+                    converted.append(plain)
+            return converted
+        if isinstance(value, dict):
+            converted = {}
+            for key, item in value.items():
+                plain = self._credit_plain_value(item)
+                if plain is not _CREDIT_UNAVAILABLE:
+                    converted[str(key)] = plain
+            return converted
+        try:
+            item = getattr(value, "item", None)
+            if callable(item):
+                return self._credit_plain_value(item())
+        except Exception:
+            return _CREDIT_UNAVAILABLE
+        try:
+            plain = self._plain_value(value)
+        except Exception:
+            return _CREDIT_UNAVAILABLE
+        if isinstance(plain, str) and plain.strip() == "<CanNotConvert>":
+            return _CREDIT_UNAVAILABLE
+        if isinstance(plain, (str, bool, int, float, list, dict)):
+            return plain
+        return _CREDIT_UNAVAILABLE
+
+    def _normalize_credit_account_id(self, value):
+        if value is None or isinstance(value, bool) or isinstance(value, (dict, list, tuple, set)):
+            raise ValueError("credit account_id must be non-empty")
+        account_id = str(value).strip()
+        if not account_id:
+            raise ValueError("credit account_id must be non-empty")
+        return account_id
+
+    def _is_credit_account_type(self, value):
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value == 3
+        if isinstance(value, str):
+            return value.strip().lower() in ("3", "credit")
+        return False
+
+    def _normalize_credit_detail_type(self, value):
+        if isinstance(value, str):
+            return value.strip().lower()
+        return str(value).strip().lower()
+
     def _generic_xttrader_call(self, method, params):
+        if self.account_locked and method not in XTTRADER_COMPAT_CANDIDATES:
+            raise ValueError("locked bridge rejects unknown xttrader generic request: %s" % method)
         candidates = XTTRADER_COMPAT_CANDIDATES.get(method, (method,))
         func = self._get_callable(*candidates)
         if not func:
@@ -706,6 +1360,13 @@ class TxTradeBridge(object):
             )
         args = list(params.get("args") or [])
         kwargs = dict(params.get("kwargs") or {})
+        if self.account_locked:
+            self._identity_values(
+                params,
+                args=args if not params.get("account") and not params.get("account_id") else None,
+                args_type_index=1 if method == "get_trade_detail_data" else None,
+                require_type=True,
+            )
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
         account_type_value = account.get("account_type") or params.get("account_type")
@@ -891,32 +1552,38 @@ class TxTradeBridge(object):
         ])
 
     def _subscribe_account(self, params, msg=None):
-        account = params.get("account") or {}
-        account_id = account.get("account_id") or params.get("account_id") or self.account_id
-        if not account_id:
-            raise ValueError("account_id is required")
-        account_id = str(account_id).strip()
-        account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        self.account_id = account_id
+        account_id, account_type, _, _, _ = self._identity_values(
+            params,
+            require_type=self.account_locked,
+        )
         client_id = ""
         if msg:
             client_id = msg.get("client_id") or msg.get("reply_channel") or ""
+        if self.account_locked and self.context is None:
+            raise RuntimeError("locked bridge account binding requires a QMT context")
+        if self.context is not None:
+            try:
+                self.context.set_account(account_id, account_type.upper())
+            except Exception:
+                # The local subscription maps are deliberately updated only
+                # after QMT accepts the account binding.
+                self.context.set_account(account_id)
+        if not self.account_locked:
+            self.account_id = account_id
         if client_id:
             with self.subscriber_lock:
                 self.account_subscribers.setdefault(account_id, set()).add(client_id)
                 self.client_accounts.setdefault(client_id, set()).add(account_id)
             account_routing.subscribe(self.bridge_id, account_id, client_id)
-        if self.context is not None:
-            try:
-                self.context.set_account(account_id, account_type.upper())
-            except Exception:
-                self.context.set_account(account_id)
         self._log("account subscribed account=%s client_id=%s" % (account_id, client_id or "-"))
         return 0
 
     def _unsubscribe_account(self, params, msg=None):
-        account = params.get("account") or {}
-        account_id = account.get("account_id") or params.get("account_id")
+        if self.account_locked:
+            account_id, _, _, _, _ = self._identity_values(params, require_type=True)
+        else:
+            account = params.get("account") or {}
+            account_id = account.get("account_id") or params.get("account_id")
         client_id = ""
         if msg:
             client_id = msg.get("client_id") or msg.get("reply_channel") or ""
@@ -943,7 +1610,7 @@ class TxTradeBridge(object):
                         if not subscribers:
                             self.account_subscribers.pop(item, None)
         account_routing.unsubscribe(self.bridge_id, account_id=account_id, client_id=client_id)
-        if account_id and account_id == self.account_id:
+        if not self.account_locked and account_id and account_id == self.account_id:
             self.account_id = ""
         self._log("account unsubscribed account=%s client_id=%s" % (account_id or "-", client_id or "-"))
         return 0
@@ -974,10 +1641,17 @@ class TxTradeBridge(object):
                 )),
                 "order_type": self._first_value(obj, (
                     "order_type",
+                    "broker_operation_code",
+                    "operation_code",
+                    "optype",
                     "direction",
                     "m_nOrderType",
-                    "m_nDirection",
-                    "m_nOffsetFlag",
+                )),
+                "broker_operation_code": self._first_value(obj, (
+                    "broker_operation_code",
+                    "operation_code",
+                    "optype",
+                    "m_nOrderType",
                 )),
                 "direction": self._first_value(obj, (
                     "direction",
@@ -985,6 +1659,15 @@ class TxTradeBridge(object):
                     "m_nOffsetFlag",
                     "m_nDirection",
                     "m_nOrderType",
+                    "broker_operation_code",
+                    "operation_code",
+                    "optype",
+                )),
+                "strategy_name": self._first_value(obj, (
+                    "strategy_name",
+                    "m_strStrategyName",
+                    "m_strStrategyID",
+                    "m_strStrategy",
                 )),
                 "price_type": self._first_value(obj, (
                     "price_type",
@@ -1102,10 +1785,17 @@ class TxTradeBridge(object):
                 )),
                 "order_type": self._first_value(obj, (
                     "order_type",
+                    "broker_operation_code",
+                    "operation_code",
+                    "optype",
                     "direction",
                     "m_nOrderType",
-                    "m_nDirection",
-                    "m_nOffsetFlag",
+                )),
+                "broker_operation_code": self._first_value(obj, (
+                    "broker_operation_code",
+                    "operation_code",
+                    "optype",
+                    "m_nOrderType",
                 )),
                 "direction": self._first_value(obj, (
                     "direction",
@@ -1113,6 +1803,15 @@ class TxTradeBridge(object):
                     "m_nOffsetFlag",
                     "m_nDirection",
                     "m_nOrderType",
+                    "broker_operation_code",
+                    "operation_code",
+                    "optype",
+                )),
+                "strategy_name": self._first_value(obj, (
+                    "strategy_name",
+                    "m_strStrategyName",
+                    "m_strStrategyID",
+                    "m_strStrategy",
                 )),
                 "price_type": self._first_value(obj, (
                     "price_type",
@@ -1231,15 +1930,23 @@ class TxTradeBridge(object):
             return payload
         return {"value": str(obj)}
 
-    def _find_order_id(self, account_id, user_order_id, strategy_name="", wait_seconds=0.3):
+    def _find_order_id(
+        self,
+        account_id,
+        user_order_id,
+        strategy_name="",
+        wait_seconds=0.3,
+        account_type="STOCK",
+    ):
         wait_seconds = float(wait_seconds or 0)
         deadline = time.time() + wait_seconds
+        query_account_type = self._order_account_type_name(account_type)
         while True:
             try:
                 orders = self._query_trade_detail(
                     {
                         "account_id": account_id,
-                        "account_type": 2,
+                        "account_type": query_account_type,
                         "strategy_name": strategy_name,
                     },
                     "order",
@@ -1248,9 +1955,16 @@ class TxTradeBridge(object):
                     remark = self._get_value(order, "order_remark")
                     if remark != user_order_id:
                         continue
+                    returned_strategy = self._get_value(order, "strategy_name")
+                    if (
+                        strategy_name
+                        and returned_strategy not in (None, "")
+                        and str(returned_strategy) != str(strategy_name)
+                    ):
+                        continue
                     for attr in ("order_sysid", "order_id", "m_strOrderSysID", "m_nOrderID", "m_strOrderID"):
                         value = self._get_value(order, attr)
-                        if value is not None and value != "":
+                        if self._is_usable_order_id(value):
                             return value
             except Exception:
                 pass
@@ -1266,9 +1980,10 @@ class TxTradeBridge(object):
         if not text:
             return False
         try:
-            return int(text) > 0
+            numeric = float(text)
         except (TypeError, ValueError):
             return True
+        return math.isfinite(numeric) and numeric > 0
 
     def _first_value(self, obj, names):
         for name in names:
@@ -1330,16 +2045,7 @@ class TxTradeBridge(object):
         return str(value)
 
     def _account_type_name(self, account_type):
-        mapping = {
-            1: "future",
-            2: "stock",
-            3: "credit",
-            5: "future_option",
-            6: "stock_option",
-            7: "hugangtong",
-            10: "new3board",
-            11: "shengangtong",
-        }
+        mapping = dict((code, name.lower()) for code, name in ACCOUNT_TYPE_CODES.items())
         if isinstance(account_type, str):
             return account_type
         return mapping.get(account_type, "stock")
@@ -1444,6 +2150,9 @@ def start_tx_trade_bridge(
     bridge_id="default",
     account_id="",
     show=True,
+    account_locked=False,
+    account_type=2,
+    callback_publisher=None,
 ):
     try:
         globals_dict = sys._getframe(1).f_globals
@@ -1459,4 +2168,7 @@ def start_tx_trade_bridge(
         account_id=account_id,
         show=show,
         globals_dict=globals_dict,
+        account_locked=account_locked,
+        account_type=account_type,
+        callback_publisher=callback_publisher,
     )

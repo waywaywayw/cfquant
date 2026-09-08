@@ -1,6 +1,6 @@
 # xtquant.xttrader 平替追踪
 
-更新时间：2026-07-08
+更新时间：2026-09-08
 
 ## 总体结论
 
@@ -10,6 +10,26 @@
 - `cfquant` 额外保留了 `disconnect()`，方便外部程序主动关闭本地桥接连接。
 - 股票交易、撤单、资产、委托、成交、持仓和交易回调已走现有 QMT 桥接实装。
 - 银行、信用、期权/期货划转、SMT、数据导出等接口已提供兼容入口，但实际可用性依赖 QMT 策略上下文中是否存在对应 callable；缺失时会返回明确的未实现错误。
+
+## 信用操作码与委托回查
+
+`cfquant.xtconstant` 使用 Windows SDK 的原生数值：`CREDIT_BUY=23`、`CREDIT_SELL=24`、`CREDIT_FIN_BUY=27`、`CREDIT_SLO_SELL=28`。其中 23/24 只在账号类型明确为 `CREDIT` 时表达信用账户的担保品买卖；不能仅凭数值把它们解释成融资/融券。
+
+`TxTradeBridge.order_stock` 在调用 QMT `passorder` 前按账号类型处理业务码：
+
+| 请求账号类型 | 请求业务码 | 实际 `passorder` 业务码 | 语义 |
+| --- | --- | --- | --- |
+| `STOCK` 或未声明 | 23/24 | 23/24 | 普通股票买/卖 |
+| 明确 `CREDIT` | 23/24 | 33/34 | 担保品买/卖 |
+| 明确 `CREDIT` | 27/28/33/34 | 原码 | 融资买/融券卖/担保品买/担保品卖 |
+
+27–34（包括还券/还款 29–32）没有明确 `CREDIT` 账号时会在 `passorder` 前拒绝；信用委托必须携带非空账号 ID，不会回退到桥的普通默认账号。缺失业务码或显式 `None` 也会在 `passorder` 前拒绝。`buy`/`sell` 和严格整数文本可作为业务码输入，布尔值、小数、空字符串和未知字符串会被拒绝。`passorder` 不返回可用订单号时，桥会按原 `order_remark`，并在回查记录提供时匹配 `strategy_name`，再从信用账户的 `credit/order` 明细中选择正数或非空稳定券商 ID；0、负数和非有限数不会被当作订单号。
+
+信用查询入口要求显式的 `StockAccount(account_id, "CREDIT")`（或账号类型 3）。标准 `query_credit_detail` 传给 QMT 的原生参数保持为 `(account_id, "credit", "account")`；直接兼容 `get_trade_detail_data` 时统一规范为 `(account_id, "CREDIT", "ACCOUNT")`，合约类查询统一使用 `(account_id, "CREDIT")`。返回值保留可读取的原生 `m_*` 字段并增加稳定别名；可选字段不可读时跳过，但身份字段不可读、账号冲突或整条记录无有效字段会失败。
+
+gateway 的 `OrderData.extra` / `TradeData.extra` 在能由原生业务码确定时增加 `credit_operation`（`collateral_buy`、`collateral_sell`、`financing_buy`、`short_sell`）和 `broker_operation_code`，并保留已有的 `broker_trade_amount`。`m_nOffsetFlag` 是另一套枚举，只用于既有方向解析，不会单独制造信用业务标记；普通方向码 48/49 也不会被臆造为信用动作。
+
+通用 vn.py `send_order` 路径在信用账号上只选择 SDK 的 `CREDIT_BUY/CREDIT_SELL`（23/24），因此当前表示担保品买卖，不默认表示融资买入或融券卖出。融资/融券需要从 CFQuant SDK 层显式传入 27/28；本包没有把它扩展成策略级融资配置或完整融资业务链路。
 
 ## 状态定义
 
