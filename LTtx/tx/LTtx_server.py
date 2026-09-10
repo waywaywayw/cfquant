@@ -27,7 +27,6 @@ need_packge = {'psutil':{'pip_name':'psutil','version':'1.0.0'},
                'lz4':{'pip_name':'lz4','version':'0.0.1'},
                'cryptography':{'pip_name':'cryptography','version':'0.0.1'},
                'tabulate':{'pip_name':'tabulate','version':'0.0.1'},
-               'hashlib':{'pip_name':'hashlib','version':'0.0.1'},
                'pandas_market_calendars':{'pip_name':'pandas_market_calendars','version':'latest'},
                'pytz':{'pip_name':'pytz','version':'0.0.0'}
                }
@@ -36,7 +35,7 @@ need_packge = {'psutil':{'pip_name':'psutil','version':'1.0.0'},
 def ensure_modules_with_version(modules: dict):
     """
     - 确保指定模块及版本已安装或自动升级（使用清华源）。
-    - 版本号中如果是latest，则每次都会去尝试更新到最新的版本，这样可以确保程序每次启动时都是用最新的库。
+    - 版本号中如果是latest，仅在模块缺失时安装，已安装模块不强制升级。
     - 版本号中如果是数字，如果当前安装的版本低于该版本，则会升级到最新版本，如果高于或等于则跳过。
     
     :param modules: dict，格式为：
@@ -53,32 +52,34 @@ def ensure_modules_with_version(modules: dict):
 
         try:
             mod = importlib.import_module(import_name)
-            if required_version == "latest":
-                print(f"[AutoInstall] 已安装 {import_name}，但指定为最新版本，将尝试升级...")
-                raise ImportError("强制升级")
-            else:
-                # 获取已安装版本
-                installed_version = getattr(mod, '__version__', None)
-                if installed_version is None:
-                    print(f"[AutoInstall] 警告：无法检测 {import_name} 的版本信息，尝试强制安装指定版本 {required_version}...")
-                    raise ImportError()
-                if version.parse(installed_version) < version.parse(required_version):
-                    print(f"[AutoInstall] 检测到 {import_name} 当前版本为 {installed_version}，小于要求的 {required_version}，将自动升级...")
-                    raise ImportError()
-                else:
-                    print(f"[AutoInstall] {import_name} 已安装，版本为 {installed_version}，满足要求")
         except ImportError:
-            # 安装或升级
-            install_target = pip_name if required_version == "latest" else "lastest"
-            print(f"[AutoInstall] 正在安装/升级 {pip_name} → {required_version}...")
-            try:
-                subprocess.check_call([
-                    sys.executable, "-m", "pip", "install", install_target,
-                    "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"
-                ])
-                print(f"[AutoInstall] 成功安装 {pip_name} {required_version}")
-            except Exception as e:
-                print(f"[AutoInstall] 安装 {pip_name} 失败: {e}")
+            install_target = pip_name if required_version == "latest" else f"{pip_name}>={required_version}"
+            print(f"[AutoInstall] 未找到 {import_name}，准备安装 {pip_name} → {required_version}...")
+        else:
+            if required_version == "latest":
+                print(f"[AutoInstall] {import_name} 已安装，跳过 latest 升级")
+                continue
+
+            installed_version = getattr(mod, '__version__', None)
+            if installed_version is None:
+                print(f"[AutoInstall] 警告：无法检测 {import_name} 的版本信息，按已安装处理并跳过安装")
+                continue
+            if version.parse(installed_version) < version.parse(required_version):
+                print(f"[AutoInstall] 检测到 {import_name} 当前版本为 {installed_version}，小于要求的 {required_version}，将自动升级...")
+                install_target = f"{pip_name}>={required_version}"
+            else:
+                print(f"[AutoInstall] {import_name} 已安装，版本为 {installed_version}，满足要求")
+                continue
+
+        print(f"[AutoInstall] 正在安装/升级 {pip_name} → {required_version}...")
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", install_target,
+                "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"
+            ])
+            print(f"[AutoInstall] 成功安装 {pip_name} {required_version}")
+        except Exception as e:
+            print(f"[AutoInstall] 安装 {pip_name} 失败: {e}")
 
 #先执行安装,再导入对应的库
 ensure_modules_with_version(need_packge)
@@ -1076,7 +1077,6 @@ if __name__ == '__main__':
     threading.Thread(target = main_control).start()
     main()
     # threading.Thread(target = main).start()
-
 
 
 
