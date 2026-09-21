@@ -109,6 +109,19 @@ ACCOUNT_DETAIL_FIELDS = (
     ("cash_in", "m_dCashIn"),
     ("deposit", "m_dDeposit"),
     ("withdraw", "m_dWithdraw"),
+    ("used_margin", "m_dUsedMargin"),
+    ("current_margin", "m_dCurrMargin"),
+    ("margin", "m_dMargin"),
+    ("raw_margin", "m_dRawMargin"),
+    ("real_used_margin", "m_dRealUsedMargin"),
+    ("frozen_margin", "m_dFrozenMargin"),
+    ("close_profit", "m_dCloseProfit"),
+    ("risk", "m_dRisk"),
+    ("real_risk_degree", "m_dRealRiskDegree"),
+    ("nav", "m_dNav"),
+    ("net_value", "m_dNetValue"),
+    ("royalty", "m_dRoyalty"),
+    ("frozen_royalty", "m_dFrozenRoyalty"),
     ("trading_date", "m_strTradingDate"),
     ("account_status", "m_strStatus"),
 )
@@ -979,6 +992,21 @@ class TxTradeBridge(object):
             return rows[0] if rows else {}
         if method == "query_com_position":
             return self._query_trade_detail(params, "position")
+        if method == "query_position_statistics":
+            # Production FUTURE QMT builds do not universally expose
+            # query_position_statistics/get_position_statistics. The native
+            # account-scoped trade detail API is available and returns the
+            # broker position rows; preserve its direction/today/yesterday
+            # fields instead of fabricating an empty statistics result.
+            _account_id, _account_type, account_type_code, _, _ = self._identity_values(
+                params,
+                require_type=self.account_locked,
+            )
+            if int(account_type_code) != 1:
+                raise ValueError(
+                    "query_position_statistics fallback requires FUTURE account"
+                )
+            return self._query_trade_detail(params, "position")
         if method == "query_stock_asset_async":
             return self._query_trade_detail(params, "account")
         if method == "query_stock_orders_async":
@@ -1025,6 +1053,8 @@ class TxTradeBridge(object):
             raise ValueError("credit query params must be a dict")
         if method == "get_trade_detail_data":
             args = params.get("args")
+            if self._is_future_trade_detail_request(args):
+                return self._dispatch_future_account_detail(params, args)
             if not self._is_credit_account_detail_request(args, params):
                 return self._generic_xttrader_call(method, params)
             account_id, call_args = self._validate_credit_native_args(method, args, params)
@@ -1038,6 +1068,29 @@ class TxTradeBridge(object):
             raise NotImplementedError("xttrader.%s requires QMT callable: %s" % (method, method))
         result = func(*call_args)
         return self._format_credit_result(result, account_id, method)
+
+    def _dispatch_future_account_detail(self, params, args):
+        if not isinstance(args, (list, tuple)) or len(args) != 3:
+            raise ValueError("get_trade_detail_data FUTURE requires exactly 3 positional args")
+        if self._normalize_credit_detail_type(args[2]) != "account":
+            raise ValueError("get_trade_detail_data FUTURE detail type must be ACCOUNT")
+        kwargs = params.get("kwargs")
+        if kwargs not in (None, {}):
+            raise ValueError("get_trade_detail_data FUTURE does not accept kwargs")
+
+        account_id, _account_type, account_type_code, _, _ = self._identity_values(
+            params,
+            args=args,
+            args_type_index=1,
+            require_type=self.account_locked,
+        )
+        if int(account_type_code) != 1:
+            raise ValueError("get_trade_detail_data FUTURE requires account type 1/FUTURE")
+
+        query_params = dict(params)
+        query_params["account_id"] = account_id
+        query_params["account_type"] = "FUTURE"
+        return self._query_trade_detail(query_params, "account")
 
     def _require_credit_account(self, params):
         if not isinstance(params, dict):
@@ -1161,6 +1214,14 @@ class TxTradeBridge(object):
             return True
         account = (params or {}).get("account")
         return isinstance(account, dict) and self._is_credit_account_type(account.get("account_type"))
+
+    def _is_future_trade_detail_request(self, args):
+        if not isinstance(args, (list, tuple)) or len(args) < 2:
+            return False
+        try:
+            return self._normalize_account_type_code(args[1]) == 1
+        except ValueError:
+            return False
 
     def _format_credit_result(self, result, account_id, native_name):
         if result is None:
@@ -1878,23 +1939,85 @@ class TxTradeBridge(object):
                 "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
             }
         if detail_type == "position":
+            volume = self._first_value(
+                obj,
+                ("position", "volume", "m_nPosition", "m_nVolume"),
+            )
+            can_close = self._first_value(
+                obj,
+                (
+                    "can_close_vol",
+                    "can_use_volume",
+                    "m_nCanCloseVolume",
+                    "m_nCanUseVolume",
+                ),
+            )
+            direction = self._first_value(
+                obj,
+                (
+                    "direction",
+                    "position_direction",
+                    "m_nDirection",
+                    "m_nPositionDirection",
+                    "m_nPosDirection",
+                ),
+            )
+            today = self._first_value(
+                obj,
+                (
+                    "today_position",
+                    "today_volume",
+                    "m_nTodayPosition",
+                    "m_nTodayVolume",
+                ),
+            )
+            yesterday = self._first_value(
+                obj,
+                (
+                    "yesterday_position",
+                    "yesterday_volume",
+                    "m_nYesterdayPosition",
+                    "m_nYdPosition",
+                    "m_nYesterdayVolume",
+                ),
+            )
             return {
                 "account_id": resolved_account_id,
                 "stock_code": self._stock_code(obj),
                 "market": self._get_value(obj, "m_strExchangeID"),
                 "instrument_name": self._get_value(obj, "m_strInstrumentName"),
-                "volume": self._get_value(obj, "m_nVolume"),
-                "can_use_volume": self._get_value(obj, "m_nCanUseVolume"),
+                "position": volume,
+                "volume": volume,
+                "can_close_vol": can_close,
+                "can_use_volume": can_close,
+                "direction": direction,
+                "position_direction": direction,
+                "today_position": today,
+                "today_volume": today,
+                "yesterday_position": yesterday,
+                "yesterday_volume": yesterday,
                 "open_price": self._get_value(obj, "m_dOpenPrice"),
+                "avg_price": self._first_value(obj, ("m_dAvgPrice", "m_dOpenPrice")),
                 "market_value": self._get_value(obj, "m_dInstrumentValue"),
                 "position_cost": self._get_value(obj, "m_dPositionCost"),
                 "position_profit": self._get_value(obj, "m_dPositionProfit"),
                 "m_strInstrumentID": self._get_value(obj, "m_strInstrumentID"),
                 "m_strExchangeID": self._get_value(obj, "m_strExchangeID"),
                 "m_strInstrumentName": self._get_value(obj, "m_strInstrumentName"),
+                "m_nPosition": self._get_value(obj, "m_nPosition"),
                 "m_nVolume": self._get_value(obj, "m_nVolume"),
+                "m_nCanCloseVolume": self._get_value(obj, "m_nCanCloseVolume"),
                 "m_nCanUseVolume": self._get_value(obj, "m_nCanUseVolume"),
+                "m_nDirection": self._get_value(obj, "m_nDirection"),
+                "m_nPositionDirection": self._get_value(obj, "m_nPositionDirection"),
+                "m_nPosDirection": self._get_value(obj, "m_nPosDirection"),
+                "m_nTodayPosition": self._get_value(obj, "m_nTodayPosition"),
+                "m_nTodayVolume": self._get_value(obj, "m_nTodayVolume"),
+                "m_nYesterdayPosition": self._get_value(obj, "m_nYesterdayPosition"),
+                "m_nYdPosition": self._get_value(obj, "m_nYdPosition"),
+                "m_nYesterdayVolume": self._get_value(obj, "m_nYesterdayVolume"),
                 "m_dOpenPrice": self._get_value(obj, "m_dOpenPrice"),
+                "m_dAvgPrice": self._get_value(obj, "m_dAvgPrice"),
                 "m_dInstrumentValue": self._get_value(obj, "m_dInstrumentValue"),
                 "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_dPositionCost": self._get_value(obj, "m_dPositionCost"),

@@ -1378,3 +1378,191 @@ def test_unlocked_batch_rejects_missing_operation_before_any_passorder() -> None
         bridge._dispatch("xttrader.order_stock_batch", params, {"id": "batch-guard"})
 
     assert [call[0] for call in context.calls] == []
+
+
+def test_future_position_statistics_falls_back_to_native_trade_detail_and_preserves_inventory() -> None:
+    calls = []
+    row = SimpleNamespace(
+        m_strAccountID="20680099",
+        m_strInstrumentID="RB2701",
+        m_strExchangeID="SF",
+        m_nPosition=3,
+        m_nCanCloseVolume=2,
+        m_nDirection=48,
+        m_nTodayPosition=1,
+        m_nYesterdayPosition=2,
+        m_dOpenPrice=3098.0,
+    )
+    context = SimpleNamespace(
+        get_trade_detail_data=lambda account_id, account_type, detail_type: (
+            calls.append((account_id, account_type, detail_type)) or [row]
+        )
+    )
+    bridge = TxTradeBridge(
+        context=context,
+        bridge_id="dl_futures",
+        account_id="20680099",
+        account_locked=True,
+        account_type="FUTURE",
+        globals_dict={},
+        show=False,
+    )
+
+    result = bridge._dispatch(
+        "xttrader.query_position_statistics",
+        {
+            "account": {"account_id": "20680099", "account_type": 1},
+            "args": [],
+            "kwargs": {},
+        },
+        {},
+    )
+
+    assert calls == [("20680099", "future", "position")]
+    assert len(result) == 1
+    position = result[0]
+    assert position["stock_code"] == "RB2701.SF"
+    assert position["position"] == 3
+    assert position["can_close_vol"] == 2
+    assert position["direction"] == 48
+    assert position["today_position"] == 1
+    assert position["yesterday_position"] == 2
+
+
+def test_future_account_formatter_preserves_margin_profit_and_trading_day_fields() -> None:
+    row = SimpleNamespace(
+        m_strAccountID="20680099",
+        m_dBalance=5000.0,
+        m_dAvailable=4200.0,
+        m_dCurrMargin=800.0,
+        m_dFrozenMargin=10.0,
+        m_dCloseProfit=12.5,
+        m_dCommission=3.2,
+        m_strTradingDate="20260921",
+    )
+    context = SimpleNamespace(
+        get_trade_detail_data=lambda account_id, account_type, detail_type: [row]
+    )
+    bridge = TxTradeBridge(
+        context=context,
+        bridge_id="dl_futures",
+        account_id="20680099",
+        account_locked=True,
+        account_type="FUTURE",
+        globals_dict={},
+        show=False,
+    )
+
+    result = bridge._dispatch(
+        "xttrader.query_stock_asset",
+        {"account": {"account_id": "20680099", "account_type": 1}},
+        {},
+    )
+
+    assert len(result) == 1
+    account = result[0]
+    assert account["current_margin"] == 800.0
+    assert account["m_dCurrMargin"] == 800.0
+    assert account["frozen_margin"] == 10.0
+    assert account["close_profit"] == 12.5
+    assert account["commission"] == 3.2
+    assert account["trading_date"] == "20260921"
+
+
+def test_locked_future_native_account_detail_is_account_scoped_and_preserves_economics() -> None:
+    row = SimpleNamespace(
+        m_strAccountID="20680099",
+        m_dBalance=5000.0,
+        m_dAvailable=4200.0,
+        m_dCurrMargin=800.0,
+        m_dFrozenMargin=10.0,
+        m_dCloseProfit=12.5,
+        m_dCommission=3.2,
+        m_strTradingDate="20260921",
+    )
+    context = LockedTradeContext(orders=[row])
+    bridge = TxTradeBridge(
+        context=context,
+        bridge_id="dl_futures",
+        account_id="20680099",
+        account_locked=True,
+        account_type="FUTURE",
+        globals_dict={},
+        show=False,
+    )
+
+    result = bridge._dispatch(
+        "xttrader.get_trade_detail_data",
+        {
+            "account_id": "20680099",
+            "account_type": "FUTURE",
+            "bridge_id": "dl_futures",
+            "args": ["20680099", "FUTURE", "ACCOUNT"],
+            "kwargs": {},
+        },
+        {},
+    )
+
+    assert context.calls == [
+        ("get_trade_detail_data", "20680099", "future", "account")
+    ]
+    account = result[0]
+    assert account["account_id"] == "20680099"
+    assert account["m_dCurrMargin"] == 800.0
+    assert account["m_dFrozenMargin"] == 10.0
+    assert account["m_dCloseProfit"] == 12.5
+    assert account["m_dCommission"] == 3.2
+    assert account["m_strTradingDate"] == "20260921"
+
+
+@pytest.mark.parametrize(
+    "params, error",
+    [
+        (
+            {
+                "account_id": "other-account",
+                "account_type": "FUTURE",
+                "bridge_id": "dl_futures",
+                "args": ["other-account", "FUTURE", "ACCOUNT"],
+                "kwargs": {},
+            },
+            "account_id mismatch",
+        ),
+        (
+            {
+                "account_id": "20680099",
+                "account_type": "FUTURE",
+                "bridge_id": "dl_futures",
+                "args": ["20680099", "FUTURE", "POSITION"],
+                "kwargs": {},
+            },
+            "detail type must be ACCOUNT",
+        ),
+        (
+            {
+                "account_id": "20680099",
+                "account_type": "FUTURE",
+                "bridge_id": "dl_futures",
+                "args": ["20680099", "FUTURE", "ACCOUNT"],
+                "kwargs": {"unexpected": True},
+            },
+            "does not accept kwargs",
+        ),
+    ],
+)
+def test_locked_future_native_account_detail_rejects_scope_expansion(params, error) -> None:
+    context = LockedTradeContext()
+    bridge = TxTradeBridge(
+        context=context,
+        bridge_id="dl_futures",
+        account_id="20680099",
+        account_locked=True,
+        account_type="FUTURE",
+        globals_dict={},
+        show=False,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        bridge._dispatch("xttrader.get_trade_detail_data", params, {})
+
+    assert context.calls == []

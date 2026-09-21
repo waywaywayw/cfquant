@@ -625,7 +625,8 @@ def main_heartbeat():
     '''
     recv_data = {1:1}
     while True:
-        for who,value in dict_client_push_group.items():
+        # Connection workers can change channels during heartbeat delivery.
+        for who,value in list(dict_client_push_group.items()):
             value['que'].put((1,recv_data))
         time.sleep(5)
 
@@ -695,7 +696,8 @@ def main_txg_heartbeat(client):
     '''
     while 1:
         try:
-            client.recv(1,socket.MSG_WAITALL)
+            if not client.recv(1,socket.MSG_WAITALL):
+                break
             # recv_data = json.loads(recv_data.decode('utf-8',errors='replace'))
         except:            
             break
