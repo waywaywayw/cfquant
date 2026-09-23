@@ -1421,16 +1421,23 @@ def test_qmt_entry_scripts_parse_as_python36() -> None:
         ast.parse(path.read_text(encoding="ascii"), filename=str(path), feature_version=(3, 6))
 
 
-def test_trade_entries_use_distinct_cooperative_nonblocking_drivers() -> None:
+def test_trade_entries_use_distinct_cooperative_nonblocking_drivers(tmp_path: Path) -> None:
+    from cfquant.payload_builder import build_payload
+
+    root = Path(__file__).resolve().parents[1]
+    credit_manifest = build_payload(
+        tmp_path / "credit_payload",
+        account_type="CREDIT",
+        account_id="28160000447",
+        bridge_id="zs_qmt2_credit",
+        model_name="CFQUANT_CREDIT_TRADE",
+        template_name="CFQUANT_TRADE_LOWLAT.py",
+        namespace="cfquant_credit",
+        source_root=root,
+    )
     paths = [
-        Path(__file__).resolve().parents[1] / "qmt_scripts" / "CFQUANT_TRADE_LOWLAT.py",
-        Path(
-            "/home/weijiawei/.local/state/codex-agent/tasks/credit-finalize-20260908-if7LZv"
-        )
-        / "artifact"
-        / "payload"
-        / "python"
-        / "CFQUANT_CREDIT_TRADE.py",
+        root / "qmt_scripts" / "CFQUANT_TRADE_LOWLAT.py",
+        Path(credit_manifest["model_path"]),
     ]
     callback_names = []
     for path in paths:

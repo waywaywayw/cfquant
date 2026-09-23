@@ -12,6 +12,9 @@ cfquant_web_config.db
 cfquant_web_config.json
 cfquant_hub_status.json
 
+log_data/
+tx_log/
+file_data/
 .updates/
 .pytest_cache/
 .mypy_cache/

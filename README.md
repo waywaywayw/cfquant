@@ -144,6 +144,19 @@ CFQUANT_INTERNAL_WHOLE_QUOTE=0
 桥日志 `cfquant_qmt_bridge.log` 默认按 10 MB 轮转并保留 2 份备份，可通过
 `CFQUANT_BRIDGE_LOG_MAX_BYTES` 和 `CFQUANT_BRIDGE_LOG_BACKUP_COUNT` 调整。
 
+运行态不必写入源码目录。受管部署可显式传入：
+
+- `CFQUANT_STATE_DIR`：Web 配置 JSON/SQLite 的状态根目录；
+- `CFQUANT_LOG_DIR`：Web、bridge 及默认子日志根目录；
+- `CFQUANT_TMP_DIR`：更新器等临时文件目录；
+- `CFQUANT_LTTX_LOG_DIR`：LTtx server 的 `log_data` 替代目录；
+- `CFQUANT_LTTX_STATE_DIR`：LTtx 的 `data0.txt` 状态目录；
+- `CFQUANT_LTTX_FILE_DIR` / `CFQUANT_LTTX_DATAFRAME_DIR`：LTtx 文件与 DataFrame 临时数据目录；
+- `CFQUANT_TX_LOG_DIR`：LTtx/QMT tx 客户端的 `tx_log` 替代目录；
+- `CFQUANT_BRIDGE_LOG_FILE`：需要精确指定单个 bridge 日志文件时使用。
+
+未设置这些变量时保留独立 CFQuant 的原有本地默认行为。
+
 ### 行情查询示例
 
 ```python
@@ -203,6 +216,23 @@ cfquant/
   docs/             部署与兼容说明
 ```
 
+## 通用隔离 Payload 构建
+
+`cfquant.payload_builder` 是 locked QMT model/隔离 Python namespace 的唯一通用 renderer。调用方必须显式提供账户类型、账户、bridge、model、template 与 namespace，不内置真实账户默认值。例如：
+
+```bash
+python -m cfquant.payload_builder \
+  --output-dir /tmp/cfquant_payload \
+  --account-type FUTURE \
+  --account-id <ACCOUNT_ID> \
+  --bridge-id dl_futures \
+  --model-name CFQUANT_DL_FUTURES_TRADE \
+  --template-name CFQUANT_TRADE_LOWLAT.py \
+  --namespace cfquant_dl_futures
+```
+
+生成的 `manifest.json` 会记录源码 commit/dirty 状态、template、账户/bridge、namespace、model 和目标位置。生成器只复制 Python 源文件，不把 `pyc` 带进 payload。WQuant 等上层系统只负责选择实例参数、staging 和远端传输。
+
 ## QMT 部署
 
 本地服务先运行在用户电脑上，负责启动 LTtx 和 Web 控制台；QMT 侧只需要加载桥接脚本。
@@ -225,7 +255,9 @@ LTtx/
 
 ## 更新机制
 
-Web 端支持为桥接端配置 Python 目录，并通过 GitHub 或 zip 源码更新核心代码。常规更新只替换目标目录中的：
+Web 端支持为桥接端配置 Python 目录，并通过 GitHub 或 zip 源码更新核心代码。常规独立使用时保持该能力；受管部署可设置 `CFQUANT_UPDATE_POLICY=managed`，并同时指定 `CFQUANT_UPDATE_REPO_URL` 与 `CFQUANT_UPDATE_REF`。managed 模式拒绝直接 zip 覆盖，并只允许所选 fork/ref 的 GitHub 更新。
+
+常规更新只替换目标目录中的：
 
 ```text
 cfquant/

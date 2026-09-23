@@ -166,7 +166,23 @@ class TxTradeBridge(object):
         self.globals_dict = globals_dict or {}
         self.running = False
         self.tx = None
-        self.log_file = os.path.join(os.getcwd(), "cfquant_qmt_bridge.log")
+        explicit_log_file = str(os.environ.get("CFQUANT_BRIDGE_LOG_FILE") or "").strip()
+        explicit_log_dir = str(os.environ.get("CFQUANT_LOG_DIR") or "").strip()
+        if explicit_log_file:
+            self.log_file = os.path.abspath(os.path.expanduser(explicit_log_file))
+        elif explicit_log_dir:
+            self.log_file = os.path.join(
+                os.path.abspath(os.path.expanduser(explicit_log_dir)),
+                "cfquant_qmt_bridge.log",
+            )
+        else:
+            self.log_file = os.path.join(os.getcwd(), "cfquant_qmt_bridge.log")
+        log_parent = os.path.dirname(os.path.abspath(self.log_file))
+        if log_parent:
+            try:
+                os.makedirs(log_parent, exist_ok=True)
+            except Exception:
+                pass
         self.log_max_bytes = int(os.environ.get("CFQUANT_BRIDGE_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
         self.log_backup_count = int(os.environ.get("CFQUANT_BRIDGE_LOG_BACKUP_COUNT", "2"))
         self.account_subscribers = {}

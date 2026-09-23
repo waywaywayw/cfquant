@@ -138,6 +138,19 @@ def start_thread(target,args):
 
 log_que = queue.Queue()
 log_list = []
+LTTX_LOG_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("CFQUANT_LTTX_LOG_DIR") or "log_data")
+)
+LTTX_STATE_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("CFQUANT_LTTX_STATE_DIR") or os.path.dirname(__file__))
+)
+LTTX_FILE_DATA_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("CFQUANT_LTTX_FILE_DIR") or "file_data")
+)
+LTTX_DATAFRAME_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("CFQUANT_LTTX_DATAFRAME_DIR") or "dataframe_data")
+)
+LTTX_STATE_FILE = os.path.join(LTTX_STATE_DIR, "data0.txt")
 
 def sys_show_on(data):
     '''
@@ -152,12 +165,16 @@ def sys_show_on(data):
 
 def main_save_log():
     try:
-        os.mkdir('log_data')
+        os.makedirs(LTTX_LOG_DIR, exist_ok=True)
     except:
         pass
     while 1:
         data = log_que.get()
-        with open('./log_data/%s_log.csv'%(time.strftime("%Y-%m-%d")),'a+',encoding='utf-8') as f:
+        log_file = os.path.join(
+            LTTX_LOG_DIR,
+            '%s_log.csv' % (time.strftime("%Y-%m-%d")),
+        )
+        with open(log_file,'a+',encoding='utf-8') as f:
             f.write(str(data)+'\n')
             
 msg = '%s>>>>>>>[info] LTtx程序启动'%(time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -248,7 +265,7 @@ def handle_connect_file(client,address,dict_data):
     if file_mode == 'upload_file':
         file_name = dict_data['file_name']
         file_hash = dict_data['file_hash']
-        file = open('./file_data/%s'%(file_name+'.tmp'),'wb')
+        file = open(os.path.join(LTTX_FILE_DATA_DIR, '%s'%(file_name+'.tmp')),'wb')
         client.sendall(b'i am ok')
         file_data = client.recv(1024)
         while file_data:
@@ -256,16 +273,19 @@ def handle_connect_file(client,address,dict_data):
             file_data = client.recv(1024)
         file.close()
         sys_show_on('%s文件接收完成'%(file_name))
-        if os.path.isfile('./file_data/%s'%(file_name)):
-            os.remove('./file_data/%s'%(file_name))
-        os.rename('./file_data/%s'%(file_name + '.tmp'), './file_data/%s'%(file_name))
+        final_path = os.path.join(LTTX_FILE_DATA_DIR, '%s' % file_name)
+        temp_path = os.path.join(LTTX_FILE_DATA_DIR, '%s' % (file_name + '.tmp'))
+        if os.path.isfile(final_path):
+            os.remove(final_path)
+        os.rename(temp_path, final_path)
        
     elif file_mode == 'download_file':
         file_name = dict_data['file_name']
         hash_md5 = hashlib.md5()
-        if os.path.isfile('./file_data/%s'%(file_name)):
+        file_path = os.path.join(LTTX_FILE_DATA_DIR, '%s' % file_name)
+        if os.path.isfile(file_path):
             client.sendall('file exist'.encode())
-            file = open('./file_data/%s'%(file_name), 'rb')
+            file = open(file_path, 'rb')
             file_data = file.read(1024)
             while file_data:
                 client.sendall(file_data)
@@ -286,7 +306,7 @@ def handle_put(var,data):
 
 que_put = queue.Queue()
 def main_handle_put():
-    file_path = os.path.join(os.path.dirname(__file__), 'data0.txt')
+    file_path = LTTX_STATE_FILE
     while True:
         var,data = que_put.get()
         try:
@@ -533,7 +553,7 @@ def handle_get_dataframe(var):
     import pandas as pd
     if var in dict_df:
         try:
-            df = pd.read_csv('./dataframe_data/%s.csv'%(var))
+            df = pd.read_csv(os.path.join(LTTX_DATAFRAME_DIR, '%s.csv' % var))
         except:
             df = pd.DataFrame()
     else:
@@ -546,7 +566,7 @@ def handle_put_dataframe(var,data):
     import pandas as pd
     try:
         df = pd.DataFrame(json.loads(data))
-        df.to_csv('./dataframe_data/%s.csv'%(var),index=False)
+        df.to_csv(os.path.join(LTTX_DATAFRAME_DIR, '%s.csv' % var),index=False)
         dict_df[var] = 1
         tem_dict = {'code':0,'msg':'success','value':{}}
     except Exception as e:
@@ -737,8 +757,7 @@ def main_test():
 
 def load_dict_var():
     try:
-        # 假设 data0.txt 和 LTtx_server.py 在同一目录
-        config_path = os.path.join(os.path.dirname(__file__), 'data0.txt')
+        config_path = LTTX_STATE_FILE
         
         # 尝试打开并读取 JSON 文件
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -952,17 +971,16 @@ def main_control():
 
 
 def make_dir():
-    flod_list = ['file_data','dataframe_data']
+    flod_list = [LTTX_FILE_DATA_DIR, LTTX_DATAFRAME_DIR, LTTX_STATE_DIR, LTTX_LOG_DIR]
     for i in flod_list:
         try:
-            os.mkdir(i)
+            os.makedirs(i, exist_ok=True)
         except:
             pass
 
 def main_save_dict_var():
     global dict_var_on, dict_var
-    # 获取当前脚本所在目录，并构建文件路径
-    file_path = os.path.join(os.path.dirname(__file__), 'data0.txt')
+    file_path = LTTX_STATE_FILE
 
     while True:
         if dict_var_on:

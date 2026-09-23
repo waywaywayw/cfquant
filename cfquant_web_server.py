@@ -51,17 +51,70 @@ from cfquant.protocol import new_id
 from tx import txl
 
 
+def _resolved_path(value, default=None):
+    raw = str(value or default or "").strip()
+    if not raw:
+        return ""
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 BASE_DIR = _PROJECT_DIR
 STATIC_DIR = os.path.join(BASE_DIR, "web_dashboard")
-LOG_FILE = os.path.join(BASE_DIR, "cfquant_web_server.runtime.log")
+STATE_DIR = _resolved_path(os.environ.get("CFQUANT_STATE_DIR"), BASE_DIR)
+LOG_DIR = _resolved_path(os.environ.get("CFQUANT_LOG_DIR"), BASE_DIR)
+TMP_DIR = _resolved_path(os.environ.get("CFQUANT_TMP_DIR"))
+LOG_FILE = _resolved_path(
+    os.environ.get("CFQUANT_WEB_LOG_FILE"),
+    os.path.join(LOG_DIR, "cfquant_web_server.runtime.log"),
+)
 LOG_RETENTION_DAYS = int(os.environ.get("CFQUANT_LOG_RETENTION_DAYS", "5"))
 LOG_CLEANUP_INTERVAL_SECONDS = float(os.environ.get("CFQUANT_LOG_CLEANUP_INTERVAL_SECONDS", "21600"))
 LTTX_HOST = os.environ.get("CFQUANT_LTTX_HOST", "127.0.0.1")
 LTTX_PORT = int(os.environ.get("CFQUANT_LTTX_PORT", "2049"))
 LTTX_DIR = os.path.join(BASE_DIR, "LTtx", "tx")
-LTTX_ENTRY = os.environ.get("CFQUANT_LTTX_ENTRY") or os.path.join(LTTX_DIR, "LTtx_server.py")
-LTTX_STDOUT_LOG = os.path.join(BASE_DIR, "lttx_server.stdout.log")
-LTTX_STDERR_LOG = os.path.join(BASE_DIR, "lttx_server.stderr.log")
+LTTX_ENTRY = _resolved_path(
+    os.environ.get("CFQUANT_LTTX_ENTRY"),
+    os.path.join(LTTX_DIR, "LTtx_server.py"),
+)
+LTTX_STDOUT_LOG = _resolved_path(
+    os.environ.get("CFQUANT_LTTX_STDOUT_LOG"),
+    os.path.join(LOG_DIR, "lttx_server.stdout.log"),
+)
+LTTX_STDERR_LOG = _resolved_path(
+    os.environ.get("CFQUANT_LTTX_STDERR_LOG"),
+    os.path.join(LOG_DIR, "lttx_server.stderr.log"),
+)
+LTTX_LOG_DIR = _resolved_path(os.environ.get("CFQUANT_LTTX_LOG_DIR"))
+LTTX_STATE_DIR = _resolved_path(os.environ.get("CFQUANT_LTTX_STATE_DIR"))
+LTTX_FILE_DIR = _resolved_path(os.environ.get("CFQUANT_LTTX_FILE_DIR"))
+LTTX_DATAFRAME_DIR = _resolved_path(os.environ.get("CFQUANT_LTTX_DATAFRAME_DIR"))
+TX_LOG_DIR = _resolved_path(os.environ.get("CFQUANT_TX_LOG_DIR"))
+if not LTTX_STATE_DIR and os.environ.get("CFQUANT_STATE_DIR"):
+    LTTX_STATE_DIR = os.path.join(STATE_DIR, "lttx")
+if not LTTX_FILE_DIR and TMP_DIR:
+    LTTX_FILE_DIR = os.path.join(TMP_DIR, "lttx_files")
+if not LTTX_DATAFRAME_DIR and TMP_DIR:
+    LTTX_DATAFRAME_DIR = os.path.join(TMP_DIR, "lttx_dataframes")
+if not TX_LOG_DIR and os.environ.get("CFQUANT_LOG_DIR"):
+    TX_LOG_DIR = os.path.join(LOG_DIR, "tx")
+    os.environ["CFQUANT_TX_LOG_DIR"] = TX_LOG_DIR
+for _runtime_file in (LOG_FILE, LTTX_STDOUT_LOG, LTTX_STDERR_LOG):
+    _ensure_parent_dir(_runtime_file)
+if TMP_DIR:
+    os.makedirs(TMP_DIR, exist_ok=True)
+if LTTX_LOG_DIR:
+    os.makedirs(LTTX_LOG_DIR, exist_ok=True)
+for _runtime_dir in (LTTX_STATE_DIR, LTTX_FILE_DIR, LTTX_DATAFRAME_DIR):
+    if _runtime_dir:
+        os.makedirs(_runtime_dir, exist_ok=True)
+if TX_LOG_DIR:
+    os.makedirs(TX_LOG_DIR, exist_ok=True)
 try:
     _LOG_FP = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
     _WINDOWLESS = os.path.basename(sys.executable).lower() == "pythonw.exe"
@@ -72,8 +125,16 @@ try:
 except Exception:
     _LOG_FP = None
 DEFAULT_ACCOUNT_ID = os.environ.get("CFQUANT_ACCOUNT_ID", "2220009880")
-WEB_CONFIG_FILE = os.environ.get("CFQUANT_WEB_CONFIG_FILE") or os.path.join(BASE_DIR, "cfquant_web_config.json")
-WEB_SETTINGS_DB_FILE = os.environ.get("CFQUANT_WEB_SETTINGS_DB_FILE") or os.path.join(BASE_DIR, "cfquant_web_config.db")
+WEB_CONFIG_FILE = _resolved_path(
+    os.environ.get("CFQUANT_WEB_CONFIG_FILE"),
+    os.path.join(STATE_DIR, "cfquant_web_config.json"),
+)
+WEB_SETTINGS_DB_FILE = _resolved_path(
+    os.environ.get("CFQUANT_WEB_SETTINGS_DB_FILE"),
+    os.path.join(STATE_DIR, "cfquant_web_config.db"),
+)
+_ensure_parent_dir(WEB_CONFIG_FILE)
+_ensure_parent_dir(WEB_SETTINGS_DB_FILE)
 RECONNECT_COOLDOWN_SECONDS = float(os.environ.get("CFQUANT_WEB_RECONNECT_COOLDOWN", "30"))
 ENV_BRIDGES = configured_bridges()
 BRIDGES = dict(ENV_BRIDGES)
@@ -88,6 +149,11 @@ STATUS_CHECK_INTERVAL_SECONDS = float(os.environ.get("CFQUANT_WEB_STATUS_INTERVA
 ACCOUNT_CACHE_REFRESH_SECONDS = float(os.environ.get("CFQUANT_WEB_ACCOUNT_CACHE_INTERVAL", "5"))
 ACCOUNT_QUERY_TIMEOUT_SECONDS = float(os.environ.get("CFQUANT_WEB_ACCOUNT_QUERY_TIMEOUT", "12"))
 UPDATE_UPLOAD_MAX_BYTES = int(os.environ.get("CFQUANT_UPDATE_UPLOAD_MAX_BYTES", str(80 * 1024 * 1024)))
+UPDATE_POLICY = str(os.environ.get("CFQUANT_UPDATE_POLICY", "standalone")).strip().lower()
+UPDATE_REPO_URL = str(os.environ.get("CFQUANT_UPDATE_REPO_URL", "")).strip()
+UPDATE_REF = str(os.environ.get("CFQUANT_UPDATE_REF", "")).strip()
+if UPDATE_POLICY not in ("standalone", "managed"):
+    raise ValueError("CFQUANT_UPDATE_POLICY must be standalone or managed")
 WEB_BOUND_HOST = None
 WEB_BOUND_PORT = None
 STOCK_BUY = 23
@@ -1162,10 +1228,12 @@ def cleanup_files_by_age(root_dir, patterns=None, retention_days=LOG_RETENTION_D
 
 def cleanup_cfquant_local_logs(retention_days=LOG_RETENTION_DAYS):
     targets = [
-        (BASE_DIR, ["*.log"], False),
-        (os.path.join(BASE_DIR, "log_data"), ["*.log", "*.csv", "*.txt"], True),
-        (os.path.join(BASE_DIR, "tx_log"), ["*.log", "*.csv", "*.txt"], True),
+        (LOG_DIR, ["*.log", "*.csv", "*.txt"], True),
     ]
+    if LTTX_LOG_DIR:
+        targets.append((LTTX_LOG_DIR, ["*.log", "*.csv", "*.txt"], True))
+    if TX_LOG_DIR:
+        targets.append((TX_LOG_DIR, ["*.log", "*.csv", "*.txt"], True))
     started = time.time()
     results = [
         cleanup_files_by_age(path, patterns=patterns, retention_days=retention_days, recursive=recursive)
@@ -1278,6 +1346,12 @@ class CfquantUpdater(object):
             "targets": {},
             "backups": [],
             "current_version": "",
+            "update_policy": {
+                "mode": UPDATE_POLICY,
+                "repo_url": UPDATE_REPO_URL if UPDATE_POLICY == "managed" else "",
+                "ref": UPDATE_REF if UPDATE_POLICY == "managed" else "",
+                "zip_allowed": UPDATE_POLICY != "managed",
+            },
         }
         if not python_dir:
             result["errors"].append("桥接端未设置 Python 目录")
@@ -1302,13 +1376,31 @@ class CfquantUpdater(object):
             result["errors"].append(str(e))
         return result
 
+    def _assert_update_allowed(self, source, repo_url="", ref=""):
+        if UPDATE_POLICY != "managed":
+            return
+        if source == "zip":
+            raise RuntimeError("managed CFQuant update policy rejects direct zip updates")
+        if not UPDATE_REPO_URL or not UPDATE_REF:
+            raise RuntimeError(
+                "managed CFQuant update policy requires CFQUANT_UPDATE_REPO_URL and CFQUANT_UPDATE_REF"
+            )
+        expected_repo = self._parse_github_repo(UPDATE_REPO_URL)
+        requested_repo = self._parse_github_repo(repo_url)
+        if requested_repo != expected_repo or str(ref or "").strip() != UPDATE_REF:
+            raise RuntimeError(
+                "managed CFQuant update must use the selected fork release "
+                "%s ref=%s" % (UPDATE_REPO_URL, UPDATE_REF)
+            )
+
     def update_from_github(self, bridge_id, repo_url, ref=""):
         repo_url = str(repo_url or "").strip()
         ref = str(ref or "").strip()
         if not repo_url:
             raise ValueError("repo_url is required")
+        self._assert_update_allowed("github", repo_url=repo_url, ref=ref)
         with self._lock:
-            with tempfile.TemporaryDirectory(prefix="cfquant_update_") as work_dir:
+            with tempfile.TemporaryDirectory(prefix="cfquant_update_", dir=TMP_DIR or None) as work_dir:
                 source_dir = os.path.join(work_dir, "source")
                 fetched = self._fetch_github(repo_url, ref, source_dir)
                 return self._install_source(bridge_id, source_dir, {
@@ -1322,8 +1414,9 @@ class CfquantUpdater(object):
         content = content or b""
         if not content:
             raise ValueError("zip content is empty")
+        self._assert_update_allowed("zip")
         with self._lock:
-            with tempfile.TemporaryDirectory(prefix="cfquant_update_") as work_dir:
+            with tempfile.TemporaryDirectory(prefix="cfquant_update_", dir=TMP_DIR or None) as work_dir:
                 zip_path = os.path.join(work_dir, "upload.zip")
                 with open(zip_path, "wb") as f:
                     f.write(content)
@@ -1884,12 +1977,26 @@ def start_lttx_server():
     if os.name == "nt":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    _ensure_parent_dir(LTTX_STDOUT_LOG)
+    _ensure_parent_dir(LTTX_STDERR_LOG)
     stdout = open(LTTX_STDOUT_LOG, "a", encoding="utf-8", buffering=1)
     stderr = open(LTTX_STDERR_LOG, "a", encoding="utf-8", buffering=1)
+    process_env = os.environ.copy()
+    if LTTX_LOG_DIR:
+        process_env["CFQUANT_LTTX_LOG_DIR"] = LTTX_LOG_DIR
+    if LTTX_STATE_DIR:
+        process_env["CFQUANT_LTTX_STATE_DIR"] = LTTX_STATE_DIR
+    if LTTX_FILE_DIR:
+        process_env["CFQUANT_LTTX_FILE_DIR"] = LTTX_FILE_DIR
+    if LTTX_DATAFRAME_DIR:
+        process_env["CFQUANT_LTTX_DATAFRAME_DIR"] = LTTX_DATAFRAME_DIR
+    if TX_LOG_DIR:
+        process_env["CFQUANT_TX_LOG_DIR"] = TX_LOG_DIR
     try:
         process = subprocess.Popen(
             [sys.executable, entry],
             cwd=cwd,
+            env=process_env,
             stdin=subprocess.DEVNULL,
             stdout=stdout,
             stderr=stderr,

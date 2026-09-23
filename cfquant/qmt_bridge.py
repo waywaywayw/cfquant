@@ -796,11 +796,26 @@ class CfquantQmtBridge(object):
         return True
 
     def _default_log_file(self):
-        try:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        except Exception:
-            base_dir = os.getcwd()
-        return os.path.join(base_dir, "cfquant_qmt_bridge.log")
+        explicit_log_file = str(os.environ.get("CFQUANT_BRIDGE_LOG_FILE") or "").strip()
+        if explicit_log_file:
+            path = os.path.abspath(os.path.expanduser(explicit_log_file))
+        else:
+            explicit_log_dir = str(os.environ.get("CFQUANT_LOG_DIR") or "").strip()
+            if explicit_log_dir:
+                base_dir = os.path.abspath(os.path.expanduser(explicit_log_dir))
+            else:
+                try:
+                    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                except Exception:
+                    base_dir = os.getcwd()
+            path = os.path.join(base_dir, "cfquant_qmt_bridge.log")
+        parent = os.path.dirname(path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except Exception:
+                pass
+        return path
 
     def _timestamp_ms(self):
         now = time.time()

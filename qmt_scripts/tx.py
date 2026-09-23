@@ -49,7 +49,10 @@ class txl:
         self.clean_day = None
         self.id = time.strftime("%Y%m%d%H%M%S")+'_'+self.create_channel(5)
         self.log_que = queue.Queue()
-        self.mkdir('tx_log')
+        self.log_dir = os.path.abspath(
+            os.path.expanduser(os.environ.get("CFQUANT_TX_LOG_DIR") or "tx_log")
+        )
+        self.mkdir(self.log_dir)
         msg = '包引入成功'
         self.save_log(msg)             
         self.loss_callback = loss_callback
@@ -160,10 +163,10 @@ class txl:
         '''
         if self.clean_day != self.get_nowdate():            
             try:
-                file_list = sorted(os.listdir('./tx_log'))
+                file_list = sorted(os.listdir(self.log_dir))
                 if len(file_list) > 30:
                     for file in file_list[:30]:
-                        file_name = './tx_log/'+file
+                        file_name = os.path.join(self.log_dir, file)
                         self.delete_file(file_name)
             except Exception as e:
                 msg = '日志自动清楚报错了>>>>>为了不影响使用体验，请查看一下原因>>>>%s'%(e)
@@ -188,7 +191,7 @@ class txl:
                     self.clean_log()
                     for i in range(100):
                         data = data + self.log_que.get() +'\n'
-                with open('./tx_log/%s.log'%(self.get_nowdate()),'a+',encoding='utf-8') as f:
+                with open(os.path.join(self.log_dir, '%s.log'%(self.get_nowdate())),'a+',encoding='utf-8') as f:
                     f.write(data)
             except:#过滤掉日志记录出错
                 #直接跳过日志记录，不影响主程序
@@ -1734,7 +1737,7 @@ class txl:
         创建一个目录，如果已经存在则会跳过
         '''
         try:
-            os.mkdir(file_name)
+            os.makedirs(file_name, exist_ok=True)
         except:
             pass
         
